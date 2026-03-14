@@ -112,7 +112,7 @@ describe('createStreamParser', () => {
     });
   });
 
-  it('result 原样转发不做过自重复去重', () => {
+  it('result 内自重复（A+A）时只保留一段', () => {
     const msg = '我是 Auto,由 Cursor 设计的 Agent 路由器。';
     const line = JSON.stringify({
       type: 'result',
@@ -121,7 +121,7 @@ describe('createStreamParser', () => {
     const out = parseNdjsonLine(line, meta);
     assert.ok(out !== null);
     const parsed = JSON.parse(out);
-    assert.strictEqual(parsed.choices[0].delta.content, msg + msg);
+    assert.strictEqual(parsed.choices[0].delta.content, msg);
   });
 
   it('流式多行相同 result 在流中只保留一遍', () => {

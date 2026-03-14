@@ -102,6 +102,24 @@ function normalizeForCompare(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
+/** 若单块内容本身是 A+A（前半段与后半段相同或 trim 后相同），只保留一段，避免如天气回复整段重复两遍 */
+function dedupeSelfRepeated(text) {
+  if (!text || text.length < 2) return text;
+  // 先尝试按 \n\n 拆成两段（整段+换行+整段）
+  const parts = text.split(/\n\s*\n/);
+  if (parts.length === 2) {
+    const a = parts[0].trim();
+    const b = parts[1].trim();
+    if (a.length >= 20 && a === b) return a;
+  }
+  const half = Math.floor(text.length / 2);
+  if (text.slice(0, half) === text.slice(half)) return text.slice(0, half);
+  const left = text.slice(0, half).trim();
+  const right = text.slice(half).trim();
+  if (left.length >= 20 && left === right) return left;
+  return text;
+}
+
 /**
  * 将 NDJSON 行转成 OpenAI chat completion chunk 的 data 行（不含 "data: " 前缀，不含 \n\n）。
  * @param {string} line
@@ -116,9 +134,10 @@ export function parseNdjsonLine(line, meta) {
     return null;
   }
 
-  const text = extractTextFromStreamLine(obj);
+  let text = extractTextFromStreamLine(obj);
   if (!text) return null;
   if (isLikelyThinkingOrHeartbeat(text)) return null;
+  text = dedupeSelfRepeated(text);
 
   const chunk = {
     id: meta.id,
