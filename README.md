@@ -3,6 +3,8 @@
 OpenClaw ↔ Cursor CLI 桥接服务：让钉钉等 IM 的请求走 Cursor 订阅，省钱且稳。
 
 - **设计文档**：[DESIGN.md](./DESIGN.md)
+- **代码梳理**（模块职责、数据流、测试覆盖）：[CODE_OVERVIEW.md](./CODE_OVERVIEW.md)
+- **知识说明与排查**（API 区别科普、图示信息、无回复排查）：[NOTES.md](./NOTES.md)
 - **Phase 1**：已实现非流式 + 流式 `/v1/chat/completions`、`/health`、超时与错误处理。
 
 ## 快速开始
@@ -31,7 +33,7 @@ npm start
 # 或 node src/server.js
 ```
 
-默认监听 `http://127.0.0.1:3847`。
+默认监听 `http://127.0.0.1:3847`。提供 `GET /health`、`GET /v1/models`（OpenAI 兼容模型列表，可减少控制台 404）、`POST /v1/chat/completions`。
 
 ### 4. 验证
 
@@ -51,11 +53,13 @@ curl -s -X POST http://127.0.0.1:3847/v1/chat/completions \
 
 1. **增加 cursor-cli provider**（`models.providers`）：
 
+**推荐使用 `openai-completions`**（界面能正常显示回复；若用 `openai-responses`，OpenClaw 对自定义 provider 的解析可能不显示内容）：
+
 ```json
 "cursor-cli": {
   "baseUrl": "http://127.0.0.1:3847/v1",
   "apiKey": "any-token-you-want",
-  "api": "openai-responses",
+  "api": "openai-completions",
   "models": [
     {
       "id": "cursor-agent",
@@ -87,6 +91,8 @@ curl -s -X POST http://127.0.0.1:3847/v1/chat/completions \
 
 配置后重启 OpenClaw Gateway，在钉钉发消息即可走 Cursor。
 
+**若桥返回 200 但界面没有任何回复**：多半是 OpenClaw 对自定义 provider 的 `openai-responses` 解析不完整。把上面的 `"api": "openai-responses"` 改成 `"api": "openai-completions"`，重启 Gateway 再试，回复会走 `POST /v1/chat/completions` 并正常显示。
+
 ## 常驻运行（可选）
 
 ```bash
@@ -96,11 +102,21 @@ pm2 save
 pm2 startup  # 按提示执行以开机自启
 ```
 
+## 测试
+
+```bash
+npm test
+```
+
+使用 Node 内置 `node:test`，覆盖：`prompt-builder`（拼 prompt）、`stream-parser`（NDJSON→SSE）、`server`（/v1/models、404、400 错误体）。
+
 ## 目录结构
 
 ```
 cursor-bridge/
 ├── DESIGN.md           # 设计文档
+├── CODE_OVERVIEW.md    # 代码梳理（模块、数据流、测试）
+├── NOTES.md            # 知识说明与排查（科普、图示信息、无回复排查）
 ├── README.md           # 本说明
 ├── package.json
 ├── .env.example / .env

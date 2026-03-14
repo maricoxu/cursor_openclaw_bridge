@@ -282,7 +282,7 @@ CURSOR_AGENT_EXTRA_ARGS=--trust            # 额外参数
       "cursor-cli": {
         "baseUrl": "http://127.0.0.1:3847/v1",
         "apiKey": "any-token-you-want",
-        "api": "openai-responses",
+        "api": "openai-completions",
         "models": [
           {
             "id": "cursor-agent",
@@ -590,6 +590,7 @@ cursor-agent 在该 workspace 下可以：
 
 ## 14. 参考资料
 
+- **知识说明与排查**（Responses vs Completions 科普、图示信息与排查步骤）：[NOTES.md](./NOTES.md)
 - **cursor-agent CLI 帮助**：`cursor-agent --help`（完整参数见本文 3.2 节）
 - **OpenClaw custom provider 文档**：`openclaw/docs/gateway/configuration-examples.md`（Local models 示例）
 - **OpenClaw models 配置**：`openclaw/docs/concepts/models.md`

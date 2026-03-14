@@ -95,38 +95,52 @@ export function runAgent({ prompt, workspace, bin, timeoutMs, model, extraArgs }
       }
 
       const content = extractContentFromJson(stdout);
+      const final = content !== undefined ? content : stdout.trim();
+      if (process.env.NODE_ENV !== 'test' && (final === '' || (content === undefined && stdout.length > 0))) {
+        console.warn('[agent-runner] 未从 stdout 解析出 result，stdout 行数:', stdout.trim().split('\n').filter(Boolean).length, '末行预览:', stdout.trim().slice(-300));
+      }
       resolve({
         ok: true,
-        content: content !== undefined ? content : stdout.trim(),
+        content: final,
         code: 0,
       });
     });
   });
 }
 
+/** 从单行 JSON 的 message.content 里抽出纯文本 */
+function textFromMessageContent(content) {
+  if (typeof content === 'string') return content;
+  if (!content || !Array.isArray(content)) return '';
+  return content.map((c) => (c && (c.text != null ? String(c.text) : c.content != null ? String(c.content) : '')) || '').join('');
+}
+
 /**
  * 从 cursor-agent --output-format json 的 stdout 中提取最终回复文本。
- * 可能格式：单行 JSON 含 result；或 NDJSON 中 type=result 的 result 字段。
+ * 优先：单行或末行的 type=result / result 字段。
+ * 若无 result（例如只调了工具、未产出 result 行）：收集所有 type=assistant 的 message.content 拼成一段，避免工具调用后无回复。
  */
 function extractContentFromJson(raw) {
   const lines = raw.trim().split('\n').filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
       const obj = JSON.parse(lines[i]);
-      if (obj.result !== undefined) return obj.result;
-      if (obj.type === 'result' && obj.result !== undefined) return obj.result;
-      if (obj.message?.content) {
-        const content = obj.message.content;
-        if (Array.isArray(content)) {
-          const text = content.map((c) => (c && c.text) || '').join('');
-          if (text) return text;
-        }
-        if (typeof content === 'string') return content;
-      }
-    } catch (_) {
-      // ignore parse error, try next line
-    }
+      if (obj.result !== undefined && obj.result !== '') return obj.result;
+      if (obj.type === 'result' && obj.result !== undefined && obj.result !== '') return obj.result;
+    } catch (_) {}
   }
+  const assistantParts = [];
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      if (!obj.message?.content) continue;
+      if (obj.type === 'assistant' || obj.type === 'result' || obj.type === 'message') {
+        const text = textFromMessageContent(obj.message.content);
+        if (text.trim()) assistantParts.push(text);
+      }
+    } catch (_) {}
+  }
+  if (assistantParts.length > 0) return assistantParts.join('\n\n');
   return undefined;
 }
 

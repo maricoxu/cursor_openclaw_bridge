@@ -4,6 +4,13 @@
 
 import http from 'http';
 import { spawn } from 'child_process';
+
+/** 从 req.url 取出 pathname（去掉 query），兼容带 ? 的请求 */
+function pathname(req) {
+  const u = req.url || '/';
+  const i = u.indexOf('?');
+  return i >= 0 ? u.slice(0, i) : u;
+}
 import { buildPrompt } from './prompt-builder.js';
 import { runAgent, runAgentStream } from './agent-runner.js';
 import { createStreamParser } from './stream-parser.js';
@@ -46,6 +53,17 @@ function checkAuth(req) {
   return auth.slice(7) === BRIDGE_API_KEY;
 }
 
+/** 若内容为完全相同（或仅空白差异）的两段拼接（模型重复输出），只保留一段 */
+function dedupeRepeatedContent(s) {
+  if (typeof s !== 'string' || s.length < 2) return s;
+  const half = Math.floor(s.length / 2);
+  const first = s.slice(0, half);
+  const second = s.slice(half);
+  if (first === second) return first;
+  if (first.trim() === second.trim()) return first.trimEnd().length < first.length ? first.trimEnd() : first;
+  return s;
+}
+
 /** 健康检查：cursor-agent 是否可用且已登录 */
 function checkCursorAgent() {
   return new Promise((resolve) => {
@@ -85,7 +103,10 @@ function checkCursorAgent() {
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === 'GET' && (req.url === '/health' || req.url === '/')) {
+  const p = pathname(req);
+  const reqLog = `[bridge] ${req.method} ${req.url}`;
+  res.once('finish', () => console.log(`${reqLog} -> ${res.statusCode}`));
+  if (req.method === 'GET' && (p === '/health' || p === '/')) {
     const agent = await checkCursorAgent();
     const status = agent.ok ? 'ok' : 'degraded';
     const cursor_agent = agent.ok ? 'available' : agent.reason || 'unavailable';
@@ -95,7 +116,24 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+  // OpenAI 兼容：模型列表；单模型 GET /v1/models/:id 也返回 200，避免 OpenClaw 探测时 404
+  const modelPayload = {
+    object: 'list',
+    data: [
+      {
+        id: MODEL_ID,
+        object: 'model',
+        created: Math.floor(Date.now() / 1000),
+        owned_by: 'cursor-bridge',
+      },
+    ],
+  };
+  if (req.method === 'GET' && (p === '/v1/models' || p.startsWith('/v1/models/'))) {
+    sendJson(res, 200, modelPayload);
+    return;
+  }
+
+  if (req.method === 'POST' && (p === '/v1/chat/completions' || p === '/v1/chat/completions/')) {
     if (!checkAuth(req)) {
       sendError(res, 401, 'Missing or invalid Authorization', 'unauthorized');
       return;
@@ -121,6 +159,11 @@ const server = http.createServer(async (req, res) => {
 
     const stream = Boolean(parsed.stream);
     const prompt = buildPrompt(messages);
+    if (process.env.NODE_ENV !== 'test') {
+      const last = messages[messages.length - 1];
+      const lastContentType = last?.content == null ? 'null' : Array.isArray(last.content) ? 'array' : typeof last.content;
+      console.log('[bridge] /v1/chat/completions request: messages=%d, lastContentType=%s, promptLen=%d', messages.length, lastContentType, prompt.length);
+    }
     if (!prompt.trim()) {
       sendError(res, 400, 'No valid message content in messages');
       return;
@@ -146,6 +189,14 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      const content = dedupeRepeatedContent(result.content != null ? String(result.content) : '');
+      if (process.env.NODE_ENV !== 'test') {
+        if (content.length === 0) {
+          console.warn('[bridge] /v1/chat/completions 200 但 content 为空，界面会无回复。可能原因：cursor-agent 未产出 result 或超时前未写完。');
+        } else {
+          console.log('[bridge] /v1/chat/completions 200, content length:', content.length, content.slice(0, 60) ? `preview: ${content.slice(0, 60)}...` : '');
+        }
+      }
       sendJson(res, 200, {
         id,
         object: 'chat.completion',
@@ -154,7 +205,7 @@ const server = http.createServer(async (req, res) => {
         choices: [
           {
             index: 0,
-            message: { role: 'assistant', content: result.content || '' },
+            message: { role: 'assistant', content },
             finish_reason: 'stop',
           },
         ],
@@ -214,13 +265,142 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // OpenResponses API：OpenClaw 配置 api: "openai-responses" 时会请求 POST /v1/responses
+  if (req.method === 'POST' && (p === '/v1/responses' || p === '/v1/responses/')) {
+    if (!checkAuth(req)) {
+      sendError(res, 401, 'Missing or invalid Authorization', 'unauthorized');
+      return;
+    }
+    let body = '';
+    for await (const chunk of req) {
+      body += chunk.toString();
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch (_) {
+      sendError(res, 400, 'Invalid JSON body');
+      return;
+    }
+    const model = parsed.model;
+    const input = parsed.input;
+    const instructions = parsed.instructions;
+    if (input === undefined) {
+      sendError(res, 400, 'input is required');
+      return;
+    }
+    function extractTextFromContent(content) {
+      if (typeof content === 'string') return content;
+      if (!content || typeof content !== 'object') return '';
+      if (Array.isArray(content)) {
+        let out = '';
+        for (const part of content) {
+          if (part && typeof part === 'object') {
+            if (part.text != null) out += String(part.text);
+            else if (part.content != null) out += String(part.content);
+          }
+        }
+        return out;
+      }
+      if (content.text != null) return String(content.text);
+      if (content.content != null) return String(content.content);
+      return '';
+    }
+    const messages = [];
+    if (instructions && typeof instructions === 'string') {
+      messages.push({ role: 'system', content: instructions });
+    }
+    if (typeof input === 'string') {
+      messages.push({ role: 'user', content: input });
+    } else if (Array.isArray(input)) {
+      for (const item of input) {
+        const role = item?.role === 'developer' ? 'system' : item?.role;
+        if (!role) continue;
+        const content = extractTextFromContent(item.content);
+        if (content || messages.length > 0) messages.push({ role, content });
+      }
+    } else if (input && typeof input === 'object') {
+      if (input.type === 'message' || input.role) {
+        const role = input.role === 'developer' ? 'system' : input.role;
+        const content = extractTextFromContent(input.content);
+        if (role) messages.push({ role, content });
+      } else if (Array.isArray(input.items)) {
+        for (const item of input.items) {
+          const role = item?.role === 'developer' ? 'system' : item?.role;
+          if (!role) continue;
+          const content = extractTextFromContent(item.content);
+          if (content || messages.length > 0) messages.push({ role, content });
+        }
+      } else if (input.content != null || input.text != null) {
+        messages.push({ role: 'user', content: String(input.content ?? input.text) });
+      }
+    }
+    if (messages.length === 0) {
+      const preview = JSON.stringify(parsed.input ?? parsed).slice(0, 400);
+      console.warn('[bridge] /v1/responses: no messages from input. input preview:', preview);
+      sendError(res, 400, 'No valid message content in input');
+      return;
+    }
+    const prompt = buildPrompt(messages);
+    if (!prompt.trim()) {
+      console.warn('[bridge] /v1/responses: prompt empty after build. messages count:', messages.length);
+      sendError(res, 400, 'No valid message content in input');
+      return;
+    }
+    const id = `rsp-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const created = Math.floor(Date.now() / 1000);
+    const result = await runAgent({
+      prompt,
+      workspace: CURSOR_WORKSPACE,
+      bin: CURSOR_AGENT_BIN,
+      timeoutMs: CURSOR_AGENT_TIMEOUT_MS,
+      model: CURSOR_AGENT_MODEL,
+      extraArgs: CURSOR_AGENT_EXTRA_ARGS,
+    });
+    if (!result.ok) {
+      const status = result.error?.includes('not logged in') ? 503 : (result.error?.includes('timeout') ? 504 : 502);
+      const code = result.error?.includes('not logged in') ? 'bridge_agent_not_ready' : 'bridge_agent_error';
+      sendError(res, status, result.error || 'cursor-agent failed', code);
+      return;
+    }
+    const assistantText = dedupeRepeatedContent(result.content != null ? String(result.content) : '');
+    if (process.env.NODE_ENV !== 'test') {
+      console.log('[bridge] /v1/responses 200, content length:', assistantText.length, assistantText.slice(0, 80) ? `preview: ${assistantText.slice(0, 80)}...` : '(empty)');
+    }
+    const responseResource = {
+      id,
+      object: 'response',
+      created_at: created,
+      status: 'completed',
+      model: model || MODEL_ID,
+      output: [
+        {
+          type: 'message',
+          id: `${id}-msg-0`,
+          role: 'assistant',
+          content: [{ type: 'output_text', id: `${id}-msg-0-text-0`, text: assistantText }],
+          status: 'completed',
+        },
+      ],
+      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    };
+    sendJson(res, 200, responseResource);
+    return;
+  }
+
   res.statusCode = 404;
   res.setHeader('Content-Type', 'application/json');
   res.end(JSON.stringify({ error: { message: 'Not Found', type: 'invalid_request' } }));
 });
 
-server.listen(BRIDGE_PORT, BRIDGE_HOST, () => {
-  console.log(`cursor-bridge ${VERSION} listening on http://${BRIDGE_HOST}:${BRIDGE_PORT}`);
-  console.log('  GET  /health');
-  console.log('  POST /v1/chat/completions');
-});
+if (process.env.NODE_ENV !== 'test') {
+  server.listen(BRIDGE_PORT, BRIDGE_HOST, () => {
+    console.log(`cursor-bridge ${VERSION} listening on http://${BRIDGE_HOST}:${BRIDGE_PORT}`);
+    console.log('  GET  /health');
+    console.log('  GET  /v1/models');
+    console.log('  POST /v1/chat/completions');
+    console.log('  POST /v1/responses (OpenResponses)');
+  });
+}
+
+export { server };
