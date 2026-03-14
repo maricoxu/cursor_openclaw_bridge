@@ -108,7 +108,12 @@ pm2 startup  # 按提示执行以开机自启
 npm test
 ```
 
-使用 Node 内置 `node:test`，覆盖：`prompt-builder`（拼 prompt）、`stream-parser`（NDJSON→SSE）、`server`（/v1/models、404、400 错误体）。
+使用 Node 内置 `node:test`。覆盖：
+
+- **单元**：`prompt-builder`（拼 prompt）、`stream-parser`（NDJSON→SSE，含 type assistant/result/顶层 content）
+- **集成**：`test/bridge.test.js` 用 **fake-agent**（`test/fixtures/fake-agent.js`）模拟 cursor-agent，测 **非流式 + 流式** `/v1/chat/completions`、多轮对话、以及「今天天气怎么样」类内容（fake-agent 根据 prompt 是否含「天气」返回不同回复）
+
+测试时自动设 `NODE_ENV=test`、`CURSOR_AGENT_BIN=node`、`CURSOR_AGENT_SCRIPT=test/fixtures/fake-agent.js`，无需真实 cursor-agent。本地改完代码跑一遍 `npm test` 通过后再上 OpenClaw 界面调试即可。
 
 ## 目录结构
 

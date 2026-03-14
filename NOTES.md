@@ -154,7 +154,100 @@
 
 **若终端里是 `POST /v1/chat/completions -> 200` 但界面仍无回复**：说明桥返回了 200 但回复体里 content 为空。桥会打一行：`[bridge] /v1/chat/completions 200 但 content 为空`。常见原因：cursor-agent 跑完了但没有产出我们认的 `result`（例如**只调了工具、没写最终一句**，或输出格式变了）；或 agent 超时被杀了、在超时前没写完。此时还会看到 `[agent-runner] 未从 stdout 解析出 result` 和末行预览，可根据末行结构再排查。
 
-**典型现象：「测试」有回复、「今天天气怎么样」无回复**：问天气时 agent 可能去调天气类工具；若只发了 tool_call、没有再用一句自然语言总结，以前我们只认 `result` 就会得到空。桥已增强：在拿不到 `result` 时，会收集所有 `type=assistant` / `result` / `message` 的 `message.content` 拼成回复，这样工具调用后只要有任意一段助理文本就能展示。重启桥后再试一次「今天天气怎么样」；若仍无回复，看终端是否有「content 为空」和 agent-runner 的末行预览，把末行贴出可继续对格式做兼容。
+**典型现象 1：「测试」有回复、「今天天气怎么样」无回复**：问天气时 agent 可能去调天气类工具；若只发了 tool_call、没有再用一句自然语言总结，以前我们只认 `result` 就会得到空。桥已增强：在拿不到 `result` 时，会收集所有 `type=assistant` / `result` / `message` 的 `message.content` 拼成回复；并会从任意一行的顶层 `output` / `content` / `text` 再兜底取一次，工具调用后只要有任意一段助理文本就能展示。
+
+**典型现象 2：「天气怎么样」有回复、「你用的模型是什么」或「测试」无回复**：可能是第二句时 prompt 更大（带上前一轮历史）、agent 超时或输出格式不同；或短回复时 cursor-agent 用了别的 JSON 结构。桥已对顶层 `output`/`content`/`text` 做兜底。若仍无回复：看终端是否出现「content 为空」和 `[agent-runner] 未从 stdout 解析出 result` 的**末行预览**，把末行贴出来可再对格式做兼容。
+
+**200 有、但界面无回复时**：说明 prompt 已正确发给 cursor-agent（可用 `CURSOR_DEBUG_PROMPT=1` 看 `.cursor-bridge-last-prompt.txt`），但**我们没从 cursor-agent 的 stdout 里解析出文本**。此时只要发生「content 为空」，桥会把 **cursor-agent 的完整 stdout** 写入 **`.cursor-bridge-last-stdout.txt`**。该文件**只会在出现「无回复」的那次请求时生成**，且固定写在 **cursor-bridge 项目根目录**（与 `package.json` 同级），与从哪个目录执行 `npm start` 无关。若目录里没有该文件，说明自上次重启桥以来还没有触发过「200 但 content 为空」；再问一次「你是什么模型」等触发无回复后即可看到。
+
+**502 刷屏、OpenClaw 一直无回复**：桥会对**非流式** completions 做**串行化**（同一时间只跑一个 runAgent），避免多实例冲突和重复 502。若仍出现连续 502，看终端里的 `[bridge] [id] runAgent failed: …` 和 `[agent-runner] cursor-agent exit code …` 或 `cursor-agent timeout`，可判断是超时、非零退出还是未登录，再对症排查。
+
+**若错误信息含 `… is not available in the slow pool. Please switch to Auto`**：这是 Cursor 侧模型/配额限制，桥会返回 **503**、code `cursor_model_unavailable`。请在 **Cursor 设置**里把模型改为 **Auto**（或选用当前 slow pool 支持的模型），不要固定指定 `claude-4.6-opus-high-thinking` 等仅在 fast pool 可用的模型。
+
+**若终端里只有 `[bridge] [id] POST /v1/chat/completions -> 200`、没有任何 `[agent-runner]` 或 `runAgent start`**：说明本次请求走的是**流式**（客户端发了 `stream: true`）。流式路径不会打 runAgent/agent-runner 的日志，且若 cursor-agent 的 stream-json 输出格式与解析器预期不一致，就可能 200 但无内容。可设置 **`CURSOR_FORCE_NON_STREAM=1`**（在 `.env` 里），桥会**内部**用 runAgent 非流式取回复，但若客户端请求的是 stream，桥仍会以 **SSE 单块**（一整段 content + [DONE]）回写，这样 OpenClaw 等只渲染流式响应的界面也能正常显示。
+
+**典型现象 3：只有第一条有回复，第二、三条是空气泡**：OpenClaw 每次请求都会带上整段历史（例如 30+ 条），第二句起 prompt 很大，cursor-agent 容易超时或产不出我们解析的 result，桥就回 200 但 content 为空。**处理办法**：用下面的 `CURSOR_MAX_MESSAGES` 限制条数。
+
+---
+
+## 4. CURSOR_MAX_MESSAGES 环境变量说明
+
+### 4.1 它是干什么的？
+
+OpenClaw 每次把**整段对话历史**都发给桥（你发过的 + 小哩回过的，一条算一条）。桥把这些消息拼成一大段文字（prompt）交给 cursor-agent。**消息越多，这段文字越长**。
+
+- **第一条**：「测试」→ 可能只有 2～5 条（系统说明 + 你这一句），prompt 短，agent 很快能回。
+- **第二、三条**：「你用的模型是什么」「今天天气怎么样」→ 请求里会带上**之前所有轮**（例如 30+ 条），prompt 变成几万字符，agent 容易超时或产不出我们认的 `result`，界面就变成空气泡。
+
+`CURSOR_MAX_MESSAGES` 的意思是：**只拿「最近 N 条」消息去拼这段 prompt，更早的丢掉**。这样第二句、第三句的请求也不会再带 30+ 条，prompt 变短，更容易在超时内跑完并有回复。
+
+### 4.1.1 为什么「只问了 3 个问题」也会变成 30+ 条、几万字符？
+
+你只发了 3 句（测试 / 你用的模型是什么 / 今天天气怎么样），但**一次请求里的 messages 不只有你这 3 条**。里面还有大量「系统/上下文」：
+
+| 来源 | 说明 |
+|------|------|
+| **系统说明** | 一条或很多条：你是小哩、你能用什么工具（read / write / exec / process…）、工具用法说明等，往往几千字。 |
+| **工作区 / HEARTBEAT** | OpenClaw 可能把当前工作区、HEARTBEAT 清单等塞进系统或单独几条消息，又会占很多字。 |
+| **你这 3 问 + 小哩的回复** | 用户 3 条 + 助理 3 条（含空气泡也算一条），一共 6 条。 |
+
+所以「messages 条数」≈ **很多条系统/上下文 + 6 条对话**。系统那部分可能被拆成十几条甚至二十几条（例如工具列表、bootstrap 各算一条），加起来就 30+ 条、拼出来几万字符。  
+也就是说：**长的主要是「系统 + 上下文」，不是你把 3 句话重复发了很多遍**。限制 `CURSOR_MAX_MESSAGES` 会优先丢掉**最早**的那批系统/上下文，只保留最近 N 条（通常最后几条才是你这 3 问 3 答），所以 prompt 会明显变短。
+
+### 4.2 只保留 20 条会有什么弊端？
+
+会。因为保留的是**最近 20 条**，被丢掉的是**最前面**的那几条：
+
+- **可能丢掉部分系统说明**：若系统/工具说明分布在最前面几条里，截断后 agent 可能看不到完整的「你是谁、能用什么工具」，表现会变怪或能力变弱。
+- **多轮对话会失忆**：例如你先说「我叫小明」，再说「我叫什么？」——若「我叫小明」在那 20 条之前被截掉，agent 就不知道你叫小明。
+
+所以 20 是折中：既压短 prompt、减少超时/无回复，又尽量保留近期对话；若你发现 agent 经常「忘了角色」或「忘了上文」，可以适当调大（例如 30），或改用下面的单轮模式。
+
+### 4.3 只针对「当前这一条」组装 prompt，可行吗？——可行，用单轮模式
+
+可以。不保留上一条对话，**只拿「当前这一句」+ 一条系统说明**去拼 prompt，在桥里叫**单轮模式**。
+
+- **做法**：在 `.env` 里设 `CURSOR_SINGLE_TURN=1`（或 `true`）。桥会只取：**1 条 system（有的话取第一条）+ 1 条当前 user（最后一条用户消息）**，不再带任何历史对话。
+- **效果**：prompt 最短，每次请求都像「新开一局」；不会超时、不会因历史过长而无回复。代价是**没有多轮记忆**：agent 不知道你上句说了啥，不能接「继续」「再详细点」这种跟上一句有关的追问。
+- **和「只保留 20 条」的关系**：单轮模式更激进（只 2 条），限条数则是「保留最近 20 条」。需要多轮对话时用 `CURSOR_MAX_MESSAGES=20`；可以接受无记忆、只要每句都回得上时用 `CURSOR_SINGLE_TURN=1`。
+
+### 4.4 取值含义小结
+
+| 配置 | 含义 |
+|------|------|
+| **CURSOR_MAX_MESSAGES=0**（默认） | 不限制条数。 |
+| **CURSOR_MAX_MESSAGES=20** | 只用最近 20 条拼 prompt；可能丢掉最前面的系统/上文。 |
+| **CURSOR_SINGLE_TURN=1** | 只拿 1 条 system + 1 条当前 user，无历史；无多轮记忆。 |
+
+### 4.5 看「输入 cursor-agent 的完整信息」：调试用
+
+想确认**到底塞给 cursor-agent 多少字、长什么样**时，在 `.env` 里设 **`CURSOR_DEBUG_PROMPT=1`**，重启桥后：
+
+- 每次请求都会把**完整 prompt** 写入 **cursor-bridge 目录下的 `.cursor-bridge-last-prompt.txt`**（每次覆盖），文件开头会写长度和约等于多少 token（按 2.5 字/token 粗估）。
+- 终端会打一行「已写入 .cursor-bridge-last-prompt.txt，长度 N 字符（约 M token）」并打印**前 600 字 + 后 400 字**预览。
+
+这样你可以直接打开该文件看「第三轮」时整段输入有多长、前面是系统说明还是历史对话，再判断是不是 prompt 过大或结构问题。看完可把 `CURSOR_DEBUG_PROMPT` 改回 0 或删掉，避免每次请求都写文件。
+
+### 4.6 cursor 每轮是独立进程、没有「上一轮」；上下文只能靠 bridge 或 memory
+
+- **cursor-agent 每次请求都是新进程**，跑完就退出，**没有进程内记忆**。它「知道」的东西，只有我们**这一次**通过 stdin/prompt 传进去的那一段。
+- 所以：要么在 **bridge 里多攒点信息**（把 OpenClaw 发来的历史都塞进 prompt，或做限条数/单轮取舍），要么配合**外部 memory 系统**：例如把历史摘要、关键事实存到 MEMORY.md 或别处，下次请求前由 bridge 或上游把「记忆」拼进 system/user，再传给 cursor-agent。这是常见做法，没有在 bridge 里实现 memory 的话，就只能在「多带历史」和「控制长度防超时」之间折中（CURSOR_MAX_MESSAGES / CURSOR_SINGLE_TURN）。
+
+### 4.7 在哪里加？怎么加？
+
+就是在 **cursor-bridge 这个代码目录下面**的 **`.env`** 文件里加。
+
+- **路径**：`cursor-bridge/.env`（和 `package.json`、`src/` 同级；若没有就复制 `.env.example` 为 `.env` 再改）。
+- **加一行**：`CURSOR_MAX_MESSAGES=20`（数字可按需要改成 10～30）。
+- **生效**：改完保存后，**重启一次 cursor-bridge**（停掉 `npm start` 再重新运行），新值才会被读进去。
+
+`.env` 里别的变量（如 `CURSOR_WORKSPACE`、`BRIDGE_PORT`）已经在那的话，和它们写在一起即可，例如：
+
+```env
+CURSOR_AGENT_EXTRA_ARGS=--trust
+# 只取最近 N 条消息拼 prompt，避免第二句起历史太长导致超时/无回复。0=不限制
+CURSOR_MAX_MESSAGES=20
+```
 
 ---
 

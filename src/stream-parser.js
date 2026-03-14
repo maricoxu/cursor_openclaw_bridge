@@ -1,9 +1,56 @@
 /**
  * 将 cursor-agent stream-json 的 NDJSON 行解析为 OpenAI 风格的 SSE 事件内容。
- * 只关心 type === "assistant" 的 message.content[].text，拼成 delta.content。
+ * 支持 type: assistant | result | message 及顶层 output/content/text，与 agent-runner 解析逻辑对齐。
  */
 
 import { Transform } from 'stream';
+
+/** 从单行 JSON 对象中抽出要作为 delta.content 的文本，与 agent-runner 的提取逻辑一致 */
+function extractTextFromStreamLine(obj) {
+  if (!obj || typeof obj !== 'object') return '';
+
+  // type === 'assistant'：message.content 数组或字符串
+  if (obj.type === 'assistant' && obj.message) {
+    const content = obj.message.content;
+    if (typeof content === 'string' && content.trim()) return content;
+    if (Array.isArray(content)) {
+      const parts = content.map((c) => (c && typeof c.text === 'string' ? c.text : (c && typeof c.content === 'string' ? c.content : '')) || '');
+      const s = parts.join('').trim();
+      if (s) return s;
+    }
+  }
+
+  // type === 'result'：result 或 output/content/text
+  if (obj.type === 'result') {
+    const r = obj.result ?? obj.output ?? obj.content ?? obj.text;
+    if (typeof r === 'string' && r.trim()) return r;
+    if (r && typeof r === 'object' && !Array.isArray(r) && (r.text != null || r.content != null)) {
+      const s = String(r.text ?? r.content ?? '').trim();
+      if (s) return s;
+    }
+  }
+
+  // type === 'message' 且 role 为 assistant
+  if (obj.type === 'message' && String((obj.role || obj.message?.role) || '').toLowerCase() === 'assistant') {
+    const content = obj.content ?? obj.message?.content ?? obj.text;
+    if (typeof content === 'string' && content.trim()) return content;
+    if (Array.isArray(content)) {
+      const parts = content.map((c) => (c && typeof c.text === 'string' ? c.text : (c && typeof c.content === 'string' ? c.content : '')) || '');
+      const s = parts.join('').trim();
+      if (s) return s;
+    }
+  }
+
+  // 顶层 output / content / text（cursor-agent 可能直接输出）
+  const top = obj.output ?? obj.content ?? obj.text;
+  if (typeof top === 'string' && top.trim()) return top;
+  if (top && typeof top === 'object' && !Array.isArray(top) && (top.text != null || top.content != null)) {
+    const s = String(top.text ?? top.content ?? '').trim();
+    if (s) return s;
+  }
+
+  return '';
+}
 
 /**
  * 将 NDJSON 行转成 OpenAI chat completion chunk 的 data 行（不含 "data: " 前缀，不含 \n\n）。
@@ -19,20 +66,7 @@ export function parseNdjsonLine(line, meta) {
     return null;
   }
 
-  if (obj.type !== 'assistant') return null;
-
-  const content = obj.message?.content;
-  if (!content) return null;
-
-  let text = '';
-  if (Array.isArray(content)) {
-    for (const c of content) {
-      if (c && typeof c.text === 'string') text += c.text;
-    }
-  } else if (typeof content === 'string') {
-    text = content;
-  }
-
+  const text = extractTextFromStreamLine(obj);
   if (!text) return null;
 
   const chunk = {

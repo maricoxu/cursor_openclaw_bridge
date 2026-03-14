@@ -2,3 +2,5 @@ node_modules/
 .env
 *.log
 .DS_Store
+.cursor-bridge-last-prompt.txt
+.cursor-bridge-last-stdout.txt

@@ -53,6 +53,22 @@ describe('parseNdjsonLine', () => {
     const line = JSON.stringify({ type: 'assistant', message: {} });
     assert.strictEqual(parseNdjsonLine(line, meta), null);
   });
+
+  it('type result 时提取 result 文本', () => {
+    const line = JSON.stringify({ type: 'result', result: '今天上海晴。' });
+    const out = parseNdjsonLine(line, meta);
+    assert.ok(out !== null);
+    const parsed = JSON.parse(out);
+    assert.strictEqual(parsed.choices[0].delta.content, '今天上海晴。');
+  });
+
+  it('顶层 content 时提取文本', () => {
+    const line = JSON.stringify({ content: '收到。' });
+    const out = parseNdjsonLine(line, meta);
+    assert.ok(out !== null);
+    const parsed = JSON.parse(out);
+    assert.strictEqual(parsed.choices[0].delta.content, '收到。');
+  });
 });
 
 describe('createStreamParser', () => {
