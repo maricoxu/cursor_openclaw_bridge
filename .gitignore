@@ -1,5 +1,7 @@
 node_modules/
 .env
+.env.swp
+*.swp
 *.log
 .DS_Store
 .cursor-bridge-last-prompt.txt

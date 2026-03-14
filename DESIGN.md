@@ -503,6 +503,84 @@ cursor-agent 在该 workspace 下可以：
 3. cursor-agent 用该 `agentDir` 作为 `--workspace`
 4. 不同 Agent 看到不同的文件上下文 → 表现出不同的「记忆」和「能力」
 
+### 10.4 Phase 3 Memory 体系运作设计（讨论稿）
+
+目标：让经桥调用的 cursor-agent **有记忆**——既能读到「记忆」上下文，又能在合适时机把本次对话沉淀回记忆。下面按三条 Phase 3 任务拆成「谁读谁写、何时、怎么接 OpenClaw」。
+
+#### 10.4.1 记忆在笔记库里的形态（约定）
+
+与 AGENTS.md / 当前实践对齐，约定：
+
+| 记忆类型 | 路径（相对 workspace 根） | 用途 |
+|----------|---------------------------|------|
+| **长期记忆** | `MEMORY.md` | 提炼后的重要事实、决策、偏好，跨会话保留 |
+| **近期日志** | `memory/YYYY-MM-DD.md` | 当日（及可选的昨日）原始记录，供「最近发生什么」 |
+| **Agent 专属记忆** | `7-Agents/<Agent名>/MEMORY.md` | 某 Agent 的长期记忆（若存在） |
+| **Agent 身份/规则** | `7-Agents/<Agent名>/SOUL.md`、`RULES.md` 等 | 已由 cursor-agent 通过 `--workspace` 读到，桥可不重复注入 |
+
+workspace 根 = 当前桥的 `CURSOR_WORKSPACE`（笔记库根）。若 Phase 3 做「按 Agent 分发 workspace」，则某 Agent 的 workspace 可以是笔记库根，也可以是 `7-Agents/xx/` 等子目录，由配置或 agent_id 映射决定。
+
+#### 10.4.2 任务一：prompt-builder 注入 Memory 上下文
+
+- **做什么**：在拼好「当前对话」的 system + 多轮 user/assistant 之前或之中，**插入一段「记忆上下文」**，让 cursor-agent 的 prompt 里自带 MEMORY.md（及可选 daily note）的摘要或全文。
+- **谁读**：桥（prompt-builder 或 server 调用的「memory 读取模块」）在收到请求后、调用 `buildPrompt` 前，从 **当前请求对应的 workspace** 读文件：
+  - `MEMORY.md`
+  - `memory/YYYY-MM-DD.md`（今日，可选昨日）
+  - 若按 Agent 分发：还可读 `7-Agents/<id>/MEMORY.md`
+- **注入方式**：把上述内容拼成一段文本（例如 `[Memory]\n...`），**预拼到 system 消息前面**，或作为第一条 system 的 content 前缀，再交给现有 `buildPrompt(messages)`。这样 cursor-agent 看到的 prompt 里已经带记忆，无需它自己先读文件（减少工具调用、延迟更可控）。
+- **边界与开放点**：
+  - **长度与裁剪**：MEMORY.md + daily 可能很长，需策略（按字符/按段/按条数裁剪、或只取「最近 N 条」）。否则容易爆上下文、拖慢首 token。
+  - **是否可配置**：例如环境变量 `CURSOR_BRIDGE_INJECT_MEMORY=1`、`CURSOR_BRIDGE_INJECT_DAILY=1`，或按 agent_id 配置「只注入根 MEMORY」「根 + daily」「根 + daily + Agent MEMORY」等。
+
+#### 10.4.3 任务二：按 Agent 分发不同 workspace
+
+- **做什么**：同一次桥请求，根据「是哪个 OpenClaw Agent」选用不同的 **workspace**（及可选的不同 memory 集合），再 spawn cursor-agent 时传对应的 `--workspace`。
+- **谁决定 workspace**：桥。输入需要「当前请求对应哪个 Agent」的标识。两种常见方式：
+  1. **请求里带 agent 标识**：OpenClaw 在请求头（如 `X-Agent-Id: 00_小哩中枢`）或 body 的扩展字段里传 `agent_id` / `agent_dir`；桥解析后查本地映射表（如「agent_id → 笔记库下的 7-Agents/00_小哩中枢」），得到 `--workspace`。
+  2. **仅用默认 workspace**：不传则用 `CURSOR_WORKSPACE`（当前行为）；传了则用映射后的目录。这样同一桥可服务多 Agent，且每个 Agent 的 RULES/SOUL/MEMORY 自然隔离（因为 cursor-agent 的 cwd 和可读文件不同）。
+- **与任务一的关系**：若按 Agent 分发，则「注入 Memory 上下文」时读的 MEMORY.md / memory/ 路径，应相对于**该 Agent 的 workspace**（例如 workspace = 7-Agents/00_小哩中枢 时，可读该目录下的 MEMORY.md 和笔记库根的 memory/YYYY-MM-DD.md，具体策略可配置）。
+
+#### 10.4.4 任务三：请求结束后自动更新 daily note
+
+- **做什么**：在一次对话（非流式结束或流式 [DONE]）结束后，**把本次交互的摘要或关键信息写回 daily note**（或 MEMORY.md），以便后续会话能通过「注入 Memory」再次被看到。
+- **谁写**：有两种实现思路：
+  1. **桥侧直接写**：桥在请求结束时，把「当前时间、最后一条 user、assistant 回复摘要」等 append 到 `memory/YYYY-MM-DD.md`（或按 agent 分到不同 daily 路径）。优点实现简单、不依赖 cursor-agent 再跑一轮；缺点桥没有「理解」能力，只能做固定模板（时间 + 原文/摘要）。
+  2. **桥触发 cursor-agent 做归档**：请求结束后，桥再 spawn 一次 cursor-agent，专门执行一条「把刚才这场对话归档到 daily / MEMORY」的 prompt（例如把上一轮的 user/assistant 和对话 id 塞进 prompt，让 agent 写文件）。优点可以写得更智能、可更新 MEMORY.md；缺点多一次调用、延迟与成本增加。
+- **时机**：流式在 `finish()` 且无错误时；非流式在拿到 `result.content` 并 200 返回后。可加开关（如 `CURSOR_BRIDGE_UPDATE_DAILY=1`）和限频（例如同一用户/会话 N 分钟内只写一次），避免刷屏。
+
+#### 10.4.5 数据流小结（Phase 3 目标态）
+
+```
+OpenClaw 请求 (messages + 可选 agent_id)
+    │
+    ▼
+桥解析 agent_id → 决定 workspace（及要注入的 memory 文件集合）
+    │
+    ▼
+桥读取 MEMORY.md / memory/YYYY-MM-DD.md（+ 可选 Agent MEMORY）
+    │
+    ▼
+拼成「[Memory] ...」注入到 system 前 → buildPrompt(messages) → 单条 prompt
+    │
+    ▼
+runAgent / runAgentStream(--workspace <该 Agent 的 workspace>)
+    │
+    ▼
+响应返回 OpenClaw
+    │
+    ▼
+（可选）请求结束后：桥写 daily 或再调 cursor-agent 做 memory 归档
+```
+
+#### 10.4.6 开放问题（待定）
+
+- **OpenClaw 是否已支持在请求里带 agent_id**：若尚未支持，需 OpenClaw 侧先扩展（header 或 body），桥再按约定解析；或短期用「单 workspace + 只注入根 MEMORY/daily」不区分 Agent。
+- **注入记忆的 token 上限与裁剪策略**：例如「MEMORY.md 最多取前 4k 字 + 今日 daily 前 2k 字」，避免首 token 过慢。
+- **daily 更新内容格式**：与现有 `memory/YYYY-MM-DD.md` 的用法（如 AI 交互记录、复盘）是否统一，是否需要和 AGENTS.md 里「Write It Down」的格式对齐。
+- **Agent 级 MEMORY.md 的维护**：若每个 Agent 有独立 MEMORY，是仅「注入读取」还是也支持「请求结束后写回该 Agent 的 MEMORY」；若写回，是否一律走 cursor-agent 归档（避免桥解析语义）。
+
+以上可作为 Phase 3 实现前与产品/OpenClaw 对齐的讨论基础；定稿后再反哺到 11 节 Phase 3 的拆项与验收标准。
+
 ---
 
 ## 11. 实施计划
@@ -511,22 +589,22 @@ cursor-agent 在该 workspace 下可以：
 
 **目标**：非流式 + 流式打通，OpenClaw 钉钉能收到 Cursor 回复
 
-- [ ] cursor-agent 登录
-- [ ] 实现 `server.js`：监听 `/v1/chat/completions` 和 `/health`
-- [ ] 实现 `prompt-builder.js`：messages → 单条 prompt
-- [ ] 实现 `agent-runner.js`：spawn cursor-agent（非流式）
-- [ ] 实现 `stream-parser.js`：NDJSON → SSE（流式）
-- [ ] 配置 OpenClaw 指向桥
-- [ ] 手动启动桥，钉钉发消息验证
+- [x] cursor-agent 登录（环境前置，非代码项）
+- [x] 实现 `server.js`：监听 `/v1/chat/completions` 和 `/health`；单测见 `test/server.test.js`、`test/bridge.test.js`。
+- [x] 实现 `prompt-builder.js`：messages → 单条 prompt；单测见 `test/prompt-builder.test.js`。
+- [x] 实现 `agent-runner.js`：spawn cursor-agent（非流式 + 流式）；单测见 `test/bridge.test.js`（使用 `test/fixtures/fake-agent.js`）。
+- [x] 实现 `stream-parser.js`：NDJSON → SSE（流式）；单测见 `test/stream-parser.test.js`。
+- [x] 配置 OpenClaw 指向桥（文档见 README / NOTES）
+- [x] 手动启动桥，钉钉发消息验证（验收步骤）
 
 ### Phase 2：稳定运行
 
 **目标**：常驻、自愈、日志
 
-- [ ] pm2 / launchd 常驻部署
-- [ ] 健康检查端点
-- [ ] 错误日志和监控
-- [ ] OpenClaw fallback 配置验证（桥挂了自动降级）
+- [x] **pm2 / launchd 常驻部署**：`npm run pm2:start` / `pm2:stop` / `pm2:restart` / `pm2:logs`；部署后可用 `npm run pm2:smoke` 校验 /health 与 /config。
+- [x] **健康检查端点**：GET /health、GET / 返回 200 及 status/cursor_agent/version；单测见 `test/phase2-stable.test.js`。
+- [x] **错误日志和监控**：错误响应均为 OpenAI 兼容 `{ error: { message, type, code? } }`；404/400/503 契约由 Phase 2 单测覆盖。
+- [x] **OpenClaw fallback 配置验证**：agent 不可用（如 not logged in）时返回 503、code `bridge_agent_not_ready`，单测用 `test/fixtures/fake-agent-fail.js` 模拟，OpenClaw 可据此降级。
 
 ### Phase 3：Memory 集成
 

@@ -17,16 +17,19 @@ function pathname(req) {
   return i >= 0 ? u.slice(0, i) : u;
 }
 import { buildPrompt } from './prompt-builder.js';
-import { runAgent, runAgentStream } from './agent-runner.js';
+import { runAgent, runAgentStream, resolveExecutable } from './agent-runner.js';
 import { createStreamParser } from './stream-parser.js';
 
 import dotenv from 'dotenv';
-if (process.env.NODE_ENV !== 'test') dotenv.config();
+if (process.env.NODE_ENV !== 'test') {
+  const projectRoot = path.join(__dirname, '..');
+  dotenv.config({ path: path.join(projectRoot, '.env') });
+}
 
 const BRIDGE_HOST = process.env.BRIDGE_HOST || '127.0.0.1';
 const BRIDGE_PORT = Number(process.env.BRIDGE_PORT) || 3847;
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY || '';
-const CURSOR_AGENT_BIN = process.env.CURSOR_AGENT_BIN || 'cursor-agent';
+const CURSOR_AGENT_BIN = resolveExecutable(process.env.CURSOR_AGENT_BIN || 'cursor-agent');
 const CURSOR_AGENT_SCRIPT = process.env.CURSOR_AGENT_SCRIPT || '';
 const CURSOR_WORKSPACE = process.env.CURSOR_WORKSPACE || process.cwd();
 const CURSOR_AGENT_TIMEOUT_MS = Number(process.env.CURSOR_AGENT_TIMEOUT_MS) || 180000;
@@ -43,6 +46,33 @@ const BRIDGE_DEBUG = /^(1|true|yes)$/i.test(process.env.CURSOR_BRIDGE_DEBUG || '
 const MODEL_ID = 'cursor-agent';
 const DEBUG_PROMPT_FILE = path.join(__dirname, '..', '.cursor-bridge-last-prompt.txt');
 const VERSION = '1.0.0';
+
+/** 当前进程生效的配置（用于启动日志与 GET /config），敏感项脱敏 */
+function getEffectiveConfig() {
+  const projectRoot = path.join(__dirname, '..');
+  const envPath = path.join(projectRoot, '.env');
+  let envLoaded = false;
+  try {
+    envLoaded = fs.existsSync(envPath);
+  } catch (_) {}
+  return {
+    envFile: envPath,
+    envFileExists: envLoaded,
+    cwd: process.cwd(),
+    BRIDGE_HOST,
+    BRIDGE_PORT,
+    BRIDGE_API_KEY: BRIDGE_API_KEY ? '(set)' : '(empty)',
+    CURSOR_AGENT_BIN,
+    CURSOR_WORKSPACE,
+    CURSOR_AGENT_TIMEOUT_MS,
+    CURSOR_AGENT_MODEL: CURSOR_AGENT_MODEL || '(empty)',
+    CURSOR_AGENT_EXTRA_ARGS: (CURSOR_AGENT_EXTRA_ARGS || '').slice(0, 80),
+    CURSOR_MAX_MESSAGES,
+    CURSOR_SINGLE_TURN,
+    CURSOR_FORCE_NON_STREAM,
+    CURSOR_BRIDGE_DEBUG: BRIDGE_DEBUG,
+  };
+}
 
 /** 非流式 completions 串行化：同一时间只跑一个 runAgent，避免多实例冲突与 502 刷屏 */
 let _completionsTail = Promise.resolve();
@@ -139,6 +169,11 @@ const server = http.createServer(async (req, res) => {
     const body = { status, cursor_agent, version: VERSION };
     res.statusCode = agent.ok ? 200 : 503;
     sendJson(res, res.statusCode, body);
+    return;
+  }
+
+  if (req.method === 'GET' && (p === '/config' || p === '/config/')) {
+    sendJson(res, 200, getEffectiveConfig());
     return;
   }
 
@@ -359,6 +394,8 @@ const server = http.createServer(async (req, res) => {
 
     parser.on('end', finish);
     parser.on('error', finish);
+    res.on('close', finish);
+    res.on('error', finish);
     agentStream.pipe(parser);
     parser.pipe(res, { end: false });
     return;
@@ -509,13 +546,11 @@ const server = http.createServer(async (req, res) => {
 
 if (process.env.NODE_ENV !== 'test') {
   server.listen(BRIDGE_PORT, BRIDGE_HOST, () => {
-    if (BRIDGE_DEBUG) {
-      console.log(`cursor-bridge ${VERSION} listening on http://${BRIDGE_HOST}:${BRIDGE_PORT}`);
-      console.log('  GET  /health');
-      console.log('  GET  /v1/models');
-      console.log('  POST /v1/chat/completions');
-      console.log('  POST /v1/responses (OpenResponses)');
-    }
+    console.log(`cursor-bridge ${VERSION} listening on http://${BRIDGE_HOST}:${BRIDGE_PORT}`);
+    console.log('  GET  /health   GET  /config   GET  /v1/models   POST /v1/chat/completions   POST /v1/responses');
+    const cfg = getEffectiveConfig();
+    console.log('[bridge] effective config: envFileExists=%s cwd=%s CURSOR_WORKSPACE=%s CURSOR_AGENT_BIN=%s CURSOR_AGENT_TIMEOUT_MS=%s',
+      cfg.envFileExists, cfg.cwd, cfg.CURSOR_WORKSPACE, cfg.CURSOR_AGENT_BIN, cfg.CURSOR_AGENT_TIMEOUT_MS);
   });
 }
 

@@ -7,7 +7,12 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "pm2:start": "pm2 start src/server.js --name cursor-bridge",
+    "pm2:stop": "pm2 stop cursor-bridge",
+    "pm2:restart": "pm2 restart cursor-bridge",
+    "pm2:logs": "pm2 logs cursor-bridge",
+    "pm2:smoke": "node scripts/pm2-smoke.mjs"
   },
   "engines": {
     "node": ">=18"

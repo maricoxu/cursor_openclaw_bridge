@@ -14,6 +14,38 @@ const DEBUG_STDOUT_FILE = path.resolve(__dirname, '..', '.cursor-bridge-last-std
 const BRIDGE_DEBUG = /^(1|true|yes)$/i.test(process.env.CURSOR_BRIDGE_DEBUG || '');
 
 /**
+ * 将可执行文件名解析为绝对路径，便于 pm2 等无完整 PATH 的环境找到 cursor-agent。
+ * 若 bin 已是绝对路径或含路径分隔符，直接返回；否则依次查 PATH 与常见目录。
+ * @param {string} bin 如 "cursor-agent" 或 "/usr/local/bin/cursor-agent"
+ * @returns {string} 解析后的路径，未找到则返回原值
+ */
+export function resolveExecutable(bin) {
+  if (!bin || typeof bin !== 'string') return bin;
+  const name = bin.trim();
+  if (!name) return bin;
+  if (path.isAbsolute(name) || name.includes(path.sep)) return name;
+  const pathEnv = process.env.PATH || '';
+  const pathDirs = pathEnv.split(path.delimiter || ':').filter(Boolean);
+  for (const dir of pathDirs) {
+    const full = path.join(dir, name);
+    try {
+      if (fs.existsSync(full)) return full;
+    } catch (_) {}
+  }
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  const fallbacks = [];
+  if (home) fallbacks.push(path.join(home, '.local', 'bin', name));
+  fallbacks.push(path.join('/usr', 'local', 'bin', name));
+  fallbacks.push(path.join('/opt', 'homebrew', 'bin', name));
+  for (const full of fallbacks) {
+    try {
+      if (fs.existsSync(full)) return full;
+    } catch (_) {}
+  }
+  return bin;
+}
+
+/**
  * 运行 cursor-agent 非流式，收集完整 stdout 后解析出 assistant 回复。
  * @param {object} opts
  * @param {string} opts.prompt
@@ -216,6 +248,7 @@ export function runAgentStream({ prompt, workspace, bin, timeoutMs, model, extra
     cwd: workspace,
     shell: false,
     env: { ...process.env, PATH: process.env.PATH || '' },
+    stdio: ['ignore', 'pipe', 'ignore'],
   });
 
   const timeout = setTimeout(() => {
@@ -234,6 +267,10 @@ export function runAgentStream({ prompt, workspace, bin, timeoutMs, model, extra
   const stream = proc.stdout;
   stream.on('close', () => clearTimeout(timeout));
   stream.on('error', () => clearTimeout(timeout));
+  proc.on('error', (err) => {
+    clearTimeout(timeout);
+    stream.destroy(err);
+  });
 
   return { stream, kill };
 }

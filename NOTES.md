@@ -255,6 +255,37 @@ CURSOR_MAX_MESSAGES=20
 
 ---
 
+## 2.8 pm2 常驻与「LLM request timed out」排查
+
+用 **pm2** 后台常驻启动桥时，若 OpenClaw 出现 **「LLM request timed out」**（尤其带 `main : heartbeat` 时），多半是：桥没起来、桥不可达、或客户端超时早于 cursor-agent 响应。
+
+**桥已做**：`server.js` 从**项目根目录**加载 `.env`（不依赖 `process.cwd()`），即使用 pm2 且未加 `--cwd`，只要进程能启动，`.env` 和 `CURSOR_WORKSPACE` 也会被正确读取。
+
+**建议排查顺序**：
+
+1. **确认桥在跑**：`pm2 list` 看 `cursor-bridge` 是否为 `online`；`pm2 logs cursor-bridge` 看是否有报错或 `listening on http://...`。
+2. **确认环境变量是否生效**：桥启动时会打一行 `[bridge] effective config: envFileExists=... cwd=... CURSOR_WORKSPACE=...`，pm2 下看 `pm2 logs cursor-bridge --lines 20` 即可核对。也可直接请求 **`GET /config`** 看当前进程实际用到的配置：`curl -s http://127.0.0.1:3847/config`（返回 JSON，含 `envFileExists`、`cwd`、`CURSOR_WORKSPACE`、`CURSOR_AGENT_BIN`、`CURSOR_AGENT_TIMEOUT_MS` 等，API key 仅显示 `(set)`/`(empty)`）。若 pm2 下 `cwd` 或 `CURSOR_WORKSPACE` 不对，说明 .env 没被读到或读错路径，桥已从**项目根**加载 `.env`，与 `process.cwd()` 无关，可再查 `.env` 是否在 cursor-bridge 根目录。
+3. **确认桥可访问**：`curl -s http://127.0.0.1:3847/health`（端口以 `.env` 里 `BRIDGE_PORT` 为准），应返回 JSON 含 `ok: true`。
+4. **确认 OpenClaw 连的是本机**：OpenClaw 里 cursor 的 baseUrl 应为 `http://127.0.0.1:3847`（或你设的 `BRIDGE_HOST:BRIDGE_PORT`），且本机防火墙未拦 3847。
+5. **心跳/对话超时**：若界面是「心跳」请求超时，说明 OpenClaw 在轮询 HEARTBEAT；cursor-agent 处理一次心跳可能要几秒到十几秒，若**客户端超时**（如 10s）短于桥/agent 响应时间，就会显示 timed out。**处理**：① 在 OpenClaw 的 cursor 配置里把**请求超时**调大（例如 60s 或 90s），具体项名以 OpenClaw 文档为准（如 `timeout`、`requestTimeout` 等）；② 桥已消费 cursor-agent 的 stderr，避免子进程写 stderr 阻塞导致首包过慢；③ 用 `CURSOR_BRIDGE_DEBUG=1` 看桥是否收到请求、是否打出 `runAgentStream start`。
+
+**pm2 error 日志里出现大段 prompt 和 `--print`/`--workspace` 等参数**：那是 **cursor-agent**（Cursor CLI）在调试时往 stderr 打的。桥在**流式**路径里已用 `stdio: ['ignore', 'pipe', 'ignore']` 把子进程 stderr 直接丢弃，这些内容不会再进桥的 error 日志；非流式路径仍会读 stderr 用于判断「not logged in」等。
+
+**为何 pm2 下超时、而 npm start 正常？** 常见原因是**客户端先断开**（OpenClaw 超时关连接）后，桥仍在向 `res` 写 SSE，下一次写入触发 EPIPE/ECONNRESET，若未监听 `res.on('close')`/`res.on('error')` 会变成未捕获异常 → 进程退出 → pm2 自动重启（`pm2 list` 里 ↺ 重启次数会很高）。桥已对流式响应做 `res.on('close', finish)` 与 `res.on('error', finish)`，客户端断开时只收尾、不再写，避免进程被写断开的 socket 拖垮。部署后观察 `pm2 list` 的 ↺ 是否不再增长。
+
+**pm2 下 `spawn cursor-agent ENOENT`**：桥会在启动时**自动解析** `CURSOR_AGENT_BIN`：若填的是裸名（如 `cursor-agent`），会依次查 **PATH** 与常见目录（`~/.local/bin`、`/usr/local/bin`、`/opt/homebrew/bin`），解析为绝对路径后再 spawn，故 pm2 下一般只需在 `.env` 里写 `CURSOR_AGENT_BIN=cursor-agent` 即可，无需手写绝对路径。若仍报 ENOENT，再改为绝对路径（如 `CURSOR_AGENT_BIN=/Users/你/.local/bin/cursor-agent`）。桥已对流式 spawn 做 `proc.on('error')` 处理，即使未找到也不会崩进程、不会把整段 spawnargs 打进 error 日志。
+
+**清理 pm2 旧日志**：`pm2 flush` 会清空 out/error 日志文件，之后只保留新输出。
+
+**pm2 启动建议**（可选）：仍建议用 `--cwd` 指向 cursor-bridge 根目录，便于日志、重启行为一致：
+
+```bash
+pm2 start src/server.js --name cursor-bridge --cwd /path/to/cursor-bridge
+pm2 save
+```
+
+---
+
 ## 3. 为什么会出现「两段相同内容」
 
 ### 3.1 为什么生成时会出两段相同内容？

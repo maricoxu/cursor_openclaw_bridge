@@ -40,8 +40,10 @@ POST /v1/chat/completions (JSON body)
 | `prompt-builder.test.js` | 空/非数组、单条 user、system+user、多轮、content 为数组/非字符串、忽略 tool 等 role |
 | `stream-parser.test.js` | parseNdjsonLine：非 assistant、content 数组/多 part、无效 JSON、无 content；createStreamParser：NDJSON→SSE |
 | `server.test.js` | GET /v1/models、404、POST /v1/chat/completions 无 body/非法 JSON/空 messages（均 400）；不启动真实 agent |
+| `bridge.test.js` | 真实 listen + fake-agent：/health、/v1/models、completions 非流式/流式、多轮与天气 |
+| `phase2-stable.test.js` | Phase 2：/health、/、/config 契约；404/400 错误体；agent 不可用时 503 与 code（OpenClaw fallback） |
 
-运行：`npm test`（`node --test test/*.test.js`）。
+运行：`npm test`（`node --test test/*.test.js`）。pm2 部署后可用 `npm run pm2:smoke` 校验 /health 与 /config。
 
 ## 5. 环境与配置
 
