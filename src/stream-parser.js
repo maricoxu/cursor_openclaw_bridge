@@ -1,9 +1,9 @@
 /**
  * 将 cursor-agent stream-json 的 NDJSON 行解析为 OpenAI 风格的 SSE 事件内容。
- * 支持 type: assistant | result | message 及顶层 output/content/text，与 agent-runner 解析逻辑对齐。
- * 仅过滤「思考/心跳指令」类内容，不展示给用户；可通过 CURSOR_STREAM_SHOW_THINKING=1 打开 thinking/reasoning 显示。
- * 事件级去重：若某条 assistant/result 的全文与已转发内容完全相同，则跳过该条（避免 Cursor 多次下发同一条导致界面多遍）。
- * 不做单条内的自重复处理，根因仍在上游 Cursor Agent。
+ * 仅处理官方文档（cursor.com/docs/cli/reference/output-format）定义的 type：assistant、result；兼容 type: message（role=assistant）。
+ * 不处理兜底顶层 output/content/text，避免与 assistant/result 重复或未定义结构导致重复转发。
+ * 仅过滤「思考/心跳指令」类内容；可通过 CURSOR_STREAM_SHOW_THINKING=1 打开 thinking/reasoning 显示。
+ * 事件级去重：同一段正文先 result 后 assistant 或反之只出一遍。
  */
 
 import { Transform } from 'stream';
@@ -64,9 +64,9 @@ function extractTextFromStreamLine(obj) {
     }
   }
 
-  // type === 'result'：result 或 output/content/text
+  // type === 'result'：仅取 result（与官方 doc 一致；不读 output/content/text 避免与其它行重复）
   if (obj.type === 'result') {
-    const r = obj.result ?? obj.output ?? obj.content ?? obj.text;
+    const r = obj.result;
     if (typeof r === 'string' && r.trim()) return r;
     if (r && typeof r === 'object' && !Array.isArray(r) && (r.text != null || r.content != null)) {
       const s = String(r.text ?? r.content ?? '').trim();
@@ -74,7 +74,7 @@ function extractTextFromStreamLine(obj) {
     }
   }
 
-  // type === 'message' 且 role 为 assistant
+  // type === 'message' 且 role 为 assistant（兼容旧版或变体格式，官方 doc 仅列 assistant/result）
   if (obj.type === 'message' && String((obj.role || obj.message?.role) || '').toLowerCase() === 'assistant') {
     const content = obj.content ?? obj.message?.content ?? obj.text;
     if (typeof content === 'string' && content.trim()) return content;
@@ -85,14 +85,6 @@ function extractTextFromStreamLine(obj) {
       const s = parts.join('').trim();
       if (s) return s;
     }
-  }
-
-  // 顶层 output / content / text（cursor-agent 可能直接输出）
-  const top = obj.output ?? obj.content ?? obj.text;
-  if (typeof top === 'string' && top.trim()) return top;
-  if (top && typeof top === 'object' && !Array.isArray(top) && (top.text != null || top.content != null)) {
-    const s = String(top.text ?? top.content ?? '').trim();
-    if (s) return s;
   }
 
   return '';
@@ -169,10 +161,17 @@ export function createStreamParser(meta) {
         const kind = String(obj.type || '').toLowerCase();
         const normNew = normalizeForEchoCheck(text);
         const normStreamed = normalizeForEchoCheck(streamedText);
+        const isContentKind = kind === 'assistant' || kind === 'result' || kind === 'message';
         const isRedundant =
           streamedText &&
-          (kind === 'assistant' || kind === 'result') &&
-          (normNew === normStreamed || (normNew.length >= 20 && normStreamed.endsWith(normNew)));
+          isContentKind &&
+          (
+            normNew === normStreamed ||
+            (normNew.length >= 20 && normStreamed.endsWith(normNew)) ||
+            normStreamed.startsWith(normNew) ||
+            (normNew.length >= 10 && normStreamed.includes(normNew)) ||
+            (normStreamed.length > normNew.length && normStreamed.includes(normNew))
+          );
         if (isRedundant) continue;
 
         const data = parseNdjsonLine(line.trim(), meta);
@@ -180,6 +179,7 @@ export function createStreamParser(meta) {
         this.push(`data: ${data}\n\n`);
         if (kind === 'assistant') streamedText += text;
         else if (kind === 'result' && !streamedText) streamedText = text;
+        else if (kind === 'message') streamedText = streamedText ? streamedText + text : text;
       }
       callback();
     },
@@ -197,16 +197,24 @@ export function createStreamParser(meta) {
             const kind = String(obj.type || '').toLowerCase();
             const normNew = normalizeForEchoCheck(text);
             const normStreamed = normalizeForEchoCheck(streamedText);
+            const isContentKind = kind === 'assistant' || kind === 'result' || kind === 'message';
             const isRedundant =
               streamedText &&
-              (kind === 'assistant' || kind === 'result') &&
-              (normNew === normStreamed || (normNew.length >= 20 && normStreamed.endsWith(normNew)));
+              isContentKind &&
+              (
+                normNew === normStreamed ||
+                (normNew.length >= 20 && normStreamed.endsWith(normNew)) ||
+                normStreamed.startsWith(normNew) ||
+                (normNew.length >= 10 && normStreamed.includes(normNew)) ||
+                (normStreamed.length > normNew.length && normStreamed.includes(normNew))
+              );
             if (!isRedundant) {
               const data = parseNdjsonLine(buffer.trim(), meta);
               if (data) {
                 this.push(`data: ${data}\n\n`);
                 if (kind === 'assistant') streamedText += text;
                 else if (kind === 'result' && !streamedText) streamedText = text;
+                else if (kind === 'message') streamedText = streamedText ? streamedText + text : text;
               }
             }
           }

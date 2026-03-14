@@ -316,11 +316,26 @@ pm2 save
 
 所以「上下文一大，更容易产生同一段内容」的底层原因可以概括成：**生成是局部依赖、按概率采样；上下文长了以后，注意力更偏向近期内容，且同一句话在上下文里已经出现，再被采样的概率仍在，就容易在结尾再生成一段相同或几乎相同的话**。根本缓解仍是：缩短上下文（少带历史轮次）或依赖上游/模型侧（Cursor Agent）的重复惩罚或产品修复。
 
-### 3.2 流式解析器当前行为
+### 3.2 流式解析器：type 与去重（当前实现）
 
-桥的流式解析（`stream-parser.js`）**不做任何去重**：收到 cursor-agent 的 NDJSON 行后，仅做「抽取文本 + 过滤 thinking/心跳」后原样转为 SSE 转发。若 Cursor Agent 输出两遍，界面就会显示两遍。
+**官方 stream-json 格式**（[Output Format](https://cursor.com/docs/cli/reference/output-format)）：`system`、`user`、`assistant`、`tool_call`、`result`。*thinking events are suppressed in print mode*。
 
-**仍保留**：**过滤思考/心跳指令**——顶层或 content 里 `type: thinking/reasoning` 默认不抽取；模型内部思考及心跳相关指令经过滤后不转发；纯心跳回复 "HEARTBEAT_OK" 仍会正常显示。**可选**：在 `.env` 中设 **`CURSOR_STREAM_SHOW_THINKING=1`**（或 `true`）可打开 thinking/reasoning 的展示。
+**2. 一共有多少种 type，我们处理了哪些？（当前表）**
+
+| type | 桥是否处理 | 说明 |
+|------|------------|------|
+| **assistant** | ✅ 处理 | 从 `message.content` 取正文（字符串或 `[{ type: "text", text: "..." }]` 拼接） |
+| **result** | ✅ 处理 | **仅**从 `result` 字段取（与官方 doc 一致；不读 output/content/text，避免与其它行重复） |
+| **message** | ✅ 处理 | 仅当 `role === assistant` 时取 `content`（兼容用；**参与事件级去重**） |
+| **thinking / reasoning / thought** | ❌ 默认不处理 | 可设 `CURSOR_STREAM_SHOW_THINKING=1` 打开 |
+| **user / system / tool_call** 等 | ❌ 不处理 | 不产出助理正文 |
+| **无 type 或仅有顶层 output/content/text** | ❌ 不处理 | **无兜底**：此类行不抽取、不转发，避免重复 |
+
+**同一条 NDJSON 不会处理两次**：只走 assistant → result → message 三个分支之一，命中即 return，无兜底。
+
+**事件级去重**：`assistant`、`result`、`message` 三种都参与。以下任一成立则当前行跳过：已转发全文 === 当前行；已转发结尾包含当前行（≥20 字）；已转发开头 === 当前行；当前行≥10 字且已转发包含；**已转发长度 > 当前行长度且已转发包含当前行**（防 result 先到后 assistant 单字/短 chunk 重复）。单测覆盖：result+单字 assistant、两行相同 assistant、result+message、无 type 不产出、result 只读 result 字段等。
+
+**事件级去重**：若同一段正文先以 `result` 整段下发、再以 `assistant` 分片下发（或先 assistant 拼出整段再 result 再发一遍），桥会视为冗余，只转发一遍。规则：已转发内容 `streamedText` 与当前行抽取的 `normNew` 比较——相等、或已转发结尾包含新内容、或已转发开头等于新内容、或新内容 ≥10 字且已转发包含新内容时，该行跳过。
 
 **若出现「两条独立气泡」**：两条气泡通常说明客户端发了**两次请求**或渲染创建了多条消息。排查：看桥终端是否有两次 `runAgentStream start`。
 
@@ -337,7 +352,7 @@ node scripts/check-agent-raw-output.mjs
 
 脚本会用与桥相同的参数调用 `cursor-agent`（prompt 为 `[User]\n你是什么模型`），把原始 NDJSON 写入 `.cursor-agent-raw-stdout.txt`，并打印「原始 stdout 中回复是否出现同一段两遍：是/否」。**实际跑过后的结论**：在仅发一条「你是什么模型」、无桥无 OpenClaw 的情况下，Cursor Agent 的**原始输出里就已经出现同一段两遍**，说明重复来自 **Cursor Agent / Cursor 产品侧**，不是 OpenClaw 或桥引入的。
 
-**根因在 Cursor 侧**：这是 Cursor Agent 的已知行为/ bug，社区有多人反馈「Agent 流式输出同一句重复多遍」或「Agent stream bug」。桥已**不做去重**，无法从 OpenClaw 或工作区 prompt 里根本修掉，需 Cursor 产品侧修复。
+**根因在 Cursor 侧**：这是 Cursor Agent 的已知行为/ bug，社区有多人反馈「Agent 流式输出同一句重复多遍」或「Agent stream bug」。桥已做**事件级去重**（同一段先 result 后 assistant 或先 assistant 后 result 只出一遍），可缓解「整段重复说两遍」；若 Cursor 单条流内就重复多次或顺序复杂，仍可能残留重复，需 Cursor 产品侧修复。
 
 **Cursor 侧可尝试的缓解**（来自社区，非官方保证）：
 - 关闭 MCP：Cursor 设置 → Tools & MCP，暂时禁用所有 MCP 后重启 Cursor，再试一次 Agent/stream。
