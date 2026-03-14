@@ -1,9 +1,8 @@
 /**
  * 将 cursor-agent stream-json 的 NDJSON 行解析为 OpenAI 风格的 SSE 事件内容。
- * 仅处理官方文档（cursor.com/docs/cli/reference/output-format）定义的 type：assistant、result；兼容 type: message（role=assistant）。
- * 不处理兜底顶层 output/content/text，避免与 assistant/result 重复或未定义结构导致重复转发。
- * 仅过滤「思考/心跳指令」类内容；可通过 CURSOR_STREAM_SHOW_THINKING=1 打开 thinking/reasoning 显示。
- * 事件级去重：同一段正文先 result 后 assistant 或反之只出一遍。
+ * 仅用于流式响应（客户端 stream: true 时）；非流式走 agent-runner 聚合 stdout，不经本模块。
+ * 仅处理 type：assistant、result；兼容 type: message（role=assistant）。不处理兜底顶层 output/content/text。
+ * 事件级去重：同一段正文只出一遍（result/assistant/message 重复、短 chunk 等均跳过）。
  */
 
 import { Transform } from 'stream';

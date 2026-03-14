@@ -288,4 +288,61 @@ describe('createStreamParser', () => {
   it('无 type 仅有顶层 content 的行不产出', () => {
     assert.strictEqual(parseNdjsonLine(JSON.stringify({ content: '不应出现' }), meta), null);
   });
+
+  it('真实场景：长段落 result 后再发同内容 assistant 只出一遍（防「用的什么模型」类两遍）', () => {
+    const full =
+      '我这边看不到当前对话具体用的是哪个模型。\n\n' +
+      '原因: 我是 Cursor 的 Auto, 只做请求路由, 拿不到「当前会话模型名称」这类信息。\n\n' +
+      '若要在 openclaw-control-ui 里显示「当前模型」: 需要在 Cursor 的配置/API, 或你们 openclaw 里「选模型/发请求」的那段逻辑里读出模型名, 再在 UI 里展示。\n\n' +
+      '如果你把 openclaw 里和「选模型/发请求」相关的配置或代码(或调用链说明)贴出来, 我可以帮你标出该从哪里取这个值; 同一份架构也可以一起标消息去重该加在哪一层。';
+    return new Promise((resolve, reject) => {
+      const parser = createStreamParser(meta);
+      const chunks = [];
+      parser.on('data', (c) => chunks.push(c.toString()));
+      parser.on('end', () => {
+        const sseText = chunks.join('');
+        const content = extractContentFromSSE(sseText);
+        assert.strictEqual(content, full, '长段落 result 后同内容 assistant 应只出一遍；若此处通过仍出现两遍则多为 Cursor Agent 顺序/格式或客户端渲染问题');
+        resolve();
+      });
+      parser.on('error', reject);
+      const lines = [
+        JSON.stringify({ type: 'result', result: full }),
+        JSON.stringify({
+          type: 'assistant',
+          message: { role: 'assistant', content: [{ type: 'text', text: full }] },
+        }),
+      ];
+      const r = new Readable({ read() {} });
+      for (const line of lines) r.push(line + '\n');
+      r.push(null);
+      r.pipe(parser);
+    });
+  });
+
+  it('真实场景：两条 assistant 均为同一条长段落时只出一遍', () => {
+    const full =
+      '我这边看不到当前对话具体用的是哪个模型。原因: 我是 Cursor 的 Auto, 只做请求路由。若要在 UI 里显示当前模型需在 openclaw 选模型/发请求逻辑里读出模型名。';
+    return new Promise((resolve, reject) => {
+      const parser = createStreamParser(meta);
+      const chunks = [];
+      parser.on('data', (c) => chunks.push(c.toString()));
+      parser.on('end', () => {
+        const sseText = chunks.join('');
+        const content = extractContentFromSSE(sseText);
+        assert.strictEqual(content, full, '两条 assistant 同内容应只出一遍');
+        resolve();
+      });
+      parser.on('error', reject);
+      const line = JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: full }] },
+      });
+      const r = new Readable({ read() {} });
+      r.push(line + '\n');
+      r.push(line + '\n');
+      r.push(null);
+      r.pipe(parser);
+    });
+  });
 });

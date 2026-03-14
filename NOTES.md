@@ -318,6 +318,8 @@ pm2 save
 
 ### 3.2 流式解析器：type 与去重（当前实现）
 
+**适用场景**：以下去重与 type 处理**仅作用于流式响应**（客户端请求 `stream: true` 时）。非流式走 agent-runner 聚合 stdout，不经 stream-parser；当前客户端均为流式，故默认即在此路径修复重复。
+
 **官方 stream-json 格式**（[Output Format](https://cursor.com/docs/cli/reference/output-format)）：`system`、`user`、`assistant`、`tool_call`、`result`。*thinking events are suppressed in print mode*。
 
 **2. 一共有多少种 type，我们处理了哪些？（当前表）**
@@ -333,9 +335,7 @@ pm2 save
 
 **同一条 NDJSON 不会处理两次**：只走 assistant → result → message 三个分支之一，命中即 return，无兜底。
 
-**事件级去重**：`assistant`、`result`、`message` 三种都参与。以下任一成立则当前行跳过：已转发全文 === 当前行；已转发结尾包含当前行（≥20 字）；已转发开头 === 当前行；当前行≥10 字且已转发包含；**已转发长度 > 当前行长度且已转发包含当前行**（防 result 先到后 assistant 单字/短 chunk 重复）。单测覆盖：result+单字 assistant、两行相同 assistant、result+message、无 type 不产出、result 只读 result 字段等。
-
-**事件级去重**：若同一段正文先以 `result` 整段下发、再以 `assistant` 分片下发（或先 assistant 拼出整段再 result 再发一遍），桥会视为冗余，只转发一遍。规则：已转发内容 `streamedText` 与当前行抽取的 `normNew` 比较——相等、或已转发结尾包含新内容、或已转发开头等于新内容、或新内容 ≥10 字且已转发包含新内容时，该行跳过。
+**事件级去重**（仅流式）：`assistant`、`result`、`message` 三种都参与。以下任一成立则当前行跳过：已转发全文 === 当前行；已转发结尾包含当前行（≥20 字）；已转发开头 === 当前行；当前行≥10 字且已转发包含；已转发长度 > 当前行长度且已转发包含当前行（防 result 后单字/短 chunk 重复）。单测覆盖：result+单字 assistant、两行相同 assistant、result+message、真实长段落两遍等。
 
 **若出现「两条独立气泡」**：两条气泡通常说明客户端发了**两次请求**或渲染创建了多条消息。排查：看桥终端是否有两次 `runAgentStream start`。
 
