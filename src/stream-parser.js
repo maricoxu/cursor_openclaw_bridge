@@ -1,9 +1,9 @@
 /**
  * 将 cursor-agent stream-json 的 NDJSON 行解析为 OpenAI 风格的 SSE 事件内容。
  * 支持 type: assistant | result | message 及顶层 output/content/text，与 agent-runner 解析逻辑对齐。
- * 过滤「思考/心跳指令」类内容，不展示给用户；可通过 CURSOR_STREAM_SHOW_THINKING=1 打开 thinking/reasoning 显示。
- * 对 Cursor 的 stream-json 语义做消费修正：stream-partial-output 下，partial assistant 已流出后，
- * 若后面又补发完整 assistant / result，不再重复转发，避免界面出现两遍相同回复。
+ * 仅过滤「思考/心跳指令」类内容，不展示给用户；可通过 CURSOR_STREAM_SHOW_THINKING=1 打开 thinking/reasoning 显示。
+ * 事件级去重：若某条 assistant/result 的全文与已转发内容完全相同，则跳过该条（避免 Cursor 多次下发同一条导致界面多遍）。
+ * 不做单条内的自重复处理，根因仍在上游 Cursor Agent。
  */
 
 import { Transform } from 'stream';
@@ -98,26 +98,9 @@ function extractTextFromStreamLine(obj) {
   return '';
 }
 
-function normalizeForCompare(text) {
+/** 仅用于事件级去重时的比较：空白规整后 trim，避免空格/换行差异导致误判 */
+function normalizeForEchoCheck(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
-}
-
-/** 若单块内容本身是 A+A（前半段与后半段相同或 trim 后相同），只保留一段，避免如天气回复整段重复两遍 */
-function dedupeSelfRepeated(text) {
-  if (!text || text.length < 2) return text;
-  // 先尝试按 \n\n 拆成两段（整段+换行+整段）
-  const parts = text.split(/\n\s*\n/);
-  if (parts.length === 2) {
-    const a = parts[0].trim();
-    const b = parts[1].trim();
-    if (a.length >= 20 && a === b) return a;
-  }
-  const half = Math.floor(text.length / 2);
-  if (text.slice(0, half) === text.slice(half)) return text.slice(0, half);
-  const left = text.slice(0, half).trim();
-  const right = text.slice(half).trim();
-  if (left.length >= 20 && left === right) return left;
-  return text;
 }
 
 /**
@@ -134,10 +117,9 @@ export function parseNdjsonLine(line, meta) {
     return null;
   }
 
-  let text = extractTextFromStreamLine(obj);
+  const text = extractTextFromStreamLine(obj);
   if (!text) return null;
   if (isLikelyThinkingOrHeartbeat(text)) return null;
-  text = dedupeSelfRepeated(text);
 
   const chunk = {
     id: meta.id,
@@ -157,13 +139,14 @@ export function parseNdjsonLine(line, meta) {
 
 /**
  * 创建一个 Transform 流：输入为 NDJSON 行（Buffer/string），输出为 SSE 格式的字符串（data: {...}\n\n）。
- * 不做去重，原样转发 cursor-agent 的输出（仅过滤 thinking/心跳）。
+ * 仅过滤 thinking/心跳；事件级去重：与已转发内容完全相同的 assistant/result 行只转发一次。
  * @param {object} meta { id, created, model }
  * @returns {Transform}
  */
 export function createStreamParser(meta) {
   let buffer = '';
-  let streamedAssistantText = '';
+  /** 已通过 SSE 转发的 assistant 内容拼接，仅用于事件级去重判断，不参与 parseNdjsonLine */
+  let streamedText = '';
 
   return new Transform({
     objectMode: false,
@@ -180,30 +163,23 @@ export function createStreamParser(meta) {
         } catch (_) {
           continue;
         }
-
         const text = extractTextFromStreamLine(obj);
-        if (!text) continue;
-        if (isLikelyThinkingOrHeartbeat(text)) continue;
+        if (!text || isLikelyThinkingOrHeartbeat(text)) continue;
 
         const kind = String(obj.type || '').toLowerCase();
-        const normalizedText = normalizeForCompare(text);
-        const normalizedAccumulated = normalizeForCompare(streamedAssistantText);
-
-        // Cursor 在 --stream-partial-output 下会先发 partial assistant，再补发一次完整 assistant，
-        // 最后 result 再给一遍完整文本。partial 已转发后，后两者应视为收尾事件而非正文。
-        if ((kind === 'assistant' || kind === 'result') && normalizedAccumulated) {
-          if (normalizedText === normalizedAccumulated || normalizedText.startsWith(normalizedAccumulated)) {
-            continue;
-          }
-        }
-        if (kind === 'result' && normalizedAccumulated) continue;
+        const normNew = normalizeForEchoCheck(text);
+        const normStreamed = normalizeForEchoCheck(streamedText);
+        const isRedundant =
+          streamedText &&
+          (kind === 'assistant' || kind === 'result') &&
+          (normNew === normStreamed || (normNew.length >= 20 && normStreamed.endsWith(normNew)));
+        if (isRedundant) continue;
 
         const data = parseNdjsonLine(line.trim(), meta);
         if (!data) continue;
-
-        if (kind === 'assistant') streamedAssistantText += text;
-        if (kind === 'result' && !streamedAssistantText) streamedAssistantText = text;
         this.push(`data: ${data}\n\n`);
+        if (kind === 'assistant') streamedText += text;
+        else if (kind === 'result' && !streamedText) streamedText = text;
       }
       callback();
     },
@@ -219,15 +195,19 @@ export function createStreamParser(meta) {
           const text = extractTextFromStreamLine(obj);
           if (text && !isLikelyThinkingOrHeartbeat(text)) {
             const kind = String(obj.type || '').toLowerCase();
-            const normalizedText = normalizeForCompare(text);
-            const normalizedAccumulated = normalizeForCompare(streamedAssistantText);
-            const isCompletionEcho =
-              normalizedAccumulated &&
+            const normNew = normalizeForEchoCheck(text);
+            const normStreamed = normalizeForEchoCheck(streamedText);
+            const isRedundant =
+              streamedText &&
               (kind === 'assistant' || kind === 'result') &&
-              (normalizedText === normalizedAccumulated || normalizedText.startsWith(normalizedAccumulated));
-            if (!isCompletionEcho && !(kind === 'result' && normalizedAccumulated)) {
+              (normNew === normStreamed || (normNew.length >= 20 && normStreamed.endsWith(normNew)));
+            if (!isRedundant) {
               const data = parseNdjsonLine(buffer.trim(), meta);
-              if (data) this.push(`data: ${data}\n\n`);
+              if (data) {
+                this.push(`data: ${data}\n\n`);
+                if (kind === 'assistant') streamedText += text;
+                else if (kind === 'result' && !streamedText) streamedText = text;
+              }
             }
           }
         }

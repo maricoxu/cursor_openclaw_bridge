@@ -71,7 +71,7 @@ describe('parseNdjsonLine', () => {
   });
 });
 
-/** 从 parser 输出的 SSE 字符串中拼接出所有 delta.content，用于断言去重 */
+/** 从 parser 输出的 SSE 字符串中拼接出所有 delta.content */
 function extractContentFromSSE(sseText) {
   const content = [];
   const lines = sseText.split(/\n\n/);
@@ -112,7 +112,7 @@ describe('createStreamParser', () => {
     });
   });
 
-  it('result 内自重复（A+A）时只保留一段', () => {
+  it('result 原样转发（含自重复内容也保留）', () => {
     const msg = '我是 Auto,由 Cursor 设计的 Agent 路由器。';
     const line = JSON.stringify({
       type: 'result',
@@ -121,10 +121,10 @@ describe('createStreamParser', () => {
     const out = parseNdjsonLine(line, meta);
     assert.ok(out !== null);
     const parsed = JSON.parse(out);
-    assert.strictEqual(parsed.choices[0].delta.content, msg);
+    assert.strictEqual(parsed.choices[0].delta.content, msg + msg);
   });
 
-  it('流式多行相同 result 在流中只保留一遍', () => {
+  it('流式多行相同 result 事件级去重只保留一遍', () => {
     const msg = '你好';
     return new Promise((resolve, reject) => {
       const parser = createStreamParser(meta);
@@ -133,7 +133,7 @@ describe('createStreamParser', () => {
       parser.on('end', () => {
         const sseText = chunks.join('');
         const content = extractContentFromSSE(sseText);
-        assert.strictEqual(content, msg, '两行相同内容在流中应只保留一遍');
+        assert.strictEqual(content, msg, '相同 result 多行只转发第一行');
         resolve();
       });
       parser.on('error', reject);
@@ -146,7 +146,7 @@ describe('createStreamParser', () => {
     });
   });
 
-  it('真实 Cursor partial assistant + 完整 assistant + result 时，只保留 partial 拼出的正文一遍', () => {
+  it('真实 Cursor partial + 完整 assistant + result 时事件级去重只出一遍正文', () => {
     const part1 = '\n我是 **Auto**';
     const part2 = '，由 Cursor 设计';
     const part3 = '的 **Agent 路由器**，负责理解你的需求并调度合适的工具与能力来协助你。\n\n如果你有具体问题或想做的事，可以直接说，我会用中文和你一起解决。';
@@ -159,7 +159,7 @@ describe('createStreamParser', () => {
       parser.on('end', () => {
         const sseText = chunks.join('');
         const content = extractContentFromSSE(sseText);
-        assert.strictEqual(content, full);
+        assert.strictEqual(content, full, 'partial 拼出 full 后，完整 assistant 与 result 视为冗余只出一遍');
         resolve();
       });
       parser.on('error', reject);
