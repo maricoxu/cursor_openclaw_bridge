@@ -71,6 +71,22 @@ describe('parseNdjsonLine', () => {
   });
 });
 
+/** 从 parser 输出的 SSE 字符串中拼接出所有 delta.content，用于断言去重 */
+function extractContentFromSSE(sseText) {
+  const content = [];
+  const lines = sseText.split(/\n\n/);
+  for (const block of lines) {
+    const m = block.match(/^data:\s*(.+)$/m);
+    if (!m) continue;
+    try {
+      const data = JSON.parse(m[1].trim());
+      if (data === '[DONE]' || data?.choices?.[0]?.delta?.content == null) continue;
+      content.push(data.choices[0].delta.content);
+    } catch (_) {}
+  }
+  return content.join('');
+}
+
 describe('createStreamParser', () => {
   it('输入 NDJSON 行输出 SSE 行', (t) => {
     return new Promise((resolve, reject) => {
@@ -91,6 +107,72 @@ describe('createStreamParser', () => {
       });
       const r = new Readable({ read() {} });
       r.push(line + '\n');
+      r.push(null);
+      r.pipe(parser);
+    });
+  });
+
+  it('result 原样转发不做过自重复去重', () => {
+    const msg = '我是 Auto,由 Cursor 设计的 Agent 路由器。';
+    const line = JSON.stringify({
+      type: 'result',
+      result: msg + msg,
+    });
+    const out = parseNdjsonLine(line, meta);
+    assert.ok(out !== null);
+    const parsed = JSON.parse(out);
+    assert.strictEqual(parsed.choices[0].delta.content, msg + msg);
+  });
+
+  it('流式多行相同 result 在流中只保留一遍', () => {
+    const msg = '你好';
+    return new Promise((resolve, reject) => {
+      const parser = createStreamParser(meta);
+      const chunks = [];
+      parser.on('data', (c) => chunks.push(c.toString()));
+      parser.on('end', () => {
+        const sseText = chunks.join('');
+        const content = extractContentFromSSE(sseText);
+        assert.strictEqual(content, msg, '两行相同内容在流中应只保留一遍');
+        resolve();
+      });
+      parser.on('error', reject);
+      const line = JSON.stringify({ type: 'result', result: msg });
+      const r = new Readable({ read() {} });
+      r.push(line + '\n');
+      r.push(line + '\n');
+      r.push(null);
+      r.pipe(parser);
+    });
+  });
+
+  it('真实 Cursor partial assistant + 完整 assistant + result 时，只保留 partial 拼出的正文一遍', () => {
+    const part1 = '\n我是 **Auto**';
+    const part2 = '，由 Cursor 设计';
+    const part3 = '的 **Agent 路由器**，负责理解你的需求并调度合适的工具与能力来协助你。\n\n如果你有具体问题或想做的事，可以直接说，我会用中文和你一起解决。';
+    const full = '我是 **Auto**，由 Cursor 设计的 **Agent 路由器**，负责理解你的需求并调度合适的工具与能力来协助你。\n\n如果你有具体问题或想做的事，可以直接说，我会用中文和你一起解决。';
+
+    return new Promise((resolve, reject) => {
+      const parser = createStreamParser(meta);
+      const chunks = [];
+      parser.on('data', (c) => chunks.push(c.toString()));
+      parser.on('end', () => {
+        const sseText = chunks.join('');
+        const content = extractContentFromSSE(sseText);
+        assert.strictEqual(content, full);
+        resolve();
+      });
+      parser.on('error', reject);
+
+      const lines = [
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: part1 }] } }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: part2 }] } }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: part3 }] } }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: full }] } }),
+        JSON.stringify({ type: 'result', subtype: 'success', result: full }),
+      ];
+      const r = new Readable({ read() {} });
+      for (const line of lines) r.push(line + '\n');
       r.push(null);
       r.pipe(parser);
     });

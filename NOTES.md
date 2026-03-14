@@ -162,11 +162,13 @@
 
 **502 刷屏、OpenClaw 一直无回复**：桥会对**非流式** completions 做**串行化**（同一时间只跑一个 runAgent），避免多实例冲突和重复 502。若仍出现连续 502，看终端里的 `[bridge] [id] runAgent failed: …` 和 `[agent-runner] cursor-agent exit code …` 或 `cursor-agent timeout`，可判断是超时、非零退出还是未登录，再对症排查。
 
-**若错误信息含 `… is not available in the slow pool. Please switch to Auto`**：这是 Cursor 侧模型/配额限制，桥会返回 **503**、code `cursor_model_unavailable`。请在 **Cursor 设置**里把模型改为 **Auto**（或选用当前 slow pool 支持的模型），不要固定指定 `claude-4.6-opus-high-thinking` 等仅在 fast pool 可用的模型。
+**若错误信息含 `… is not available in the slow pool. Please switch to Auto`**：这是 Cursor 侧模型/配额限制，桥会返回 **503**、code `cursor_model_unavailable`。**推荐**：在 **cursor-bridge 的 `.env`** 里设 **`CURSOR_AGENT_MODEL=auto`**，桥会传 `--model auto` 给 cursor-agent，由 Cursor 自动选模型，省用量、避免 503；也可在 Cursor 设置里把默认模型改为 Auto。不要固定用 `claude-4.6-opus-high-thinking` 等贵模型跑简单对话。
 
 **若终端里只有 `[bridge] [id] POST /v1/chat/completions -> 200`、没有任何 `[agent-runner]` 或 `runAgent start`**：说明本次请求走的是**流式**（客户端发了 `stream: true`）。流式路径不会打 runAgent/agent-runner 的日志，且若 cursor-agent 的 stream-json 输出格式与解析器预期不一致，就可能 200 但无内容。可设置 **`CURSOR_FORCE_NON_STREAM=1`**（在 `.env` 里），桥会**内部**用 runAgent 非流式取回复，但若客户端请求的是 stream，桥仍会以 **SSE 单块**（一整段 content + [DONE]）回写，这样 OpenClaw 等只渲染流式响应的界面也能正常显示。
 
 **典型现象 3：只有第一条有回复，第二、三条是空气泡**：OpenClaw 每次请求都会带上整段历史（例如 30+ 条），第二句起 prompt 很大，cursor-agent 容易超时或产不出我们解析的 result，桥就回 200 但 content 为空。**处理办法**：用下面的 `CURSOR_MAX_MESSAGES` 限制条数。
+
+**典型现象 4：第一条有回复，第二条（如「今天天气怎么样」）一直转圈、像在循环**：多半是**流式**请求下，cursor-agent 对这类问题会调工具/联网，迟迟不输出「结束」信号（或没有我们认的 `type: result` 行），桥就从不发送 `[DONE]`，OpenClaw 一直等 → 表现为转圈/循环。**桥已做**：流式路径增加**超时强制结束**（到 `CURSOR_AGENT_TIMEOUT_MS` 后主动写 `[DONE]` 并结束响应），避免无限转圈；超时后客户端会收到已输出的内容 + 结束。**建议排查顺序**：① 先在 `.env` 里设 **`CURSOR_FORCE_NON_STREAM=1`**，重启桥，再问一次「今天天气怎么样」——桥会内部走非流式，一次拿完整 stdout；看终端是否打 `runAgent done`、是否有 `content length: 0`，若有「content 为空」会生成 `.cursor-bridge-last-stdout.txt`，打开可看到 cursor-agent 对这次请求的完整输出，便于判断是超时、只调了工具无 result，还是格式问题。② 确认非流式能拿到回复或至少看到 stdout 后，再关掉 `CURSOR_FORCE_NON_STREAM` 用流式；流式下现在有超时兜底，不会无限转圈。
 
 ---
 
@@ -251,11 +253,11 @@ CURSOR_MAX_MESSAGES=20
 
 ---
 
-## 3. 为什么会出现「两段相同内容」与流式如何去重
+## 3. 为什么会出现「两段相同内容」
 
 ### 3.1 为什么生成时会出两段相同内容？
 
-**先说明「要重启谁」**：去重逻辑在 **cursor-bridge**（本桥）里，不在 OpenClaw。若改完代码后仍看到两遍，需要**重启 cursor-bridge**（停掉 `npm start` 再重新跑），不用重启 OpenClaw。若重启桥后仍两遍，可能是两段有细微差别（空格、标点），桥已做「两段 trim 后相同也去重」的放宽处理。
+**桥当前不做去重**：流式解析器已移除所有去重逻辑，重复问题视为 **Cursor Agent 侧** 责任；桥只做 NDJSON → SSE 解析及 thinking/心跳过滤。
 
 可能原因（不互斥）：
 
@@ -265,7 +267,7 @@ CURSOR_MAX_MESSAGES=20
 | **解码/采样** | 生成长回复时，若重复惩罚不够或采样碰巧，模型会沿着「收到! 测试成功…」再生成一遍相同或极像的段落。 |
 | **接口/实现** | 从目前实现看我们只取一条 `result`，更可能是模型侧重复；若上游把同一段拼两次也会出现，但较少见。 |
 
-**可做的缓解**：控制发给桥的对话轮数（例如只带最近 N 条）、或依赖桥侧「整段重复」去重（非流式已做，流式见下）。
+**可做的缓解**：控制发给桥的对话轮数（例如只带最近 N 条）；桥侧不做去重，需 Cursor 产品侧修复。
 
 ### 3.1.1 底层一点：为什么「上下文一大」更容易重复同一段？
 
@@ -279,14 +281,34 @@ CURSOR_MAX_MESSAGES=20
   2. **有效记忆变短**：长上下文下，模型更依赖「近处的 token」；早先的消息虽然还在，但权重会被摊薄。所以它更容易「跟着刚写的那几句」继续写，而不是牢牢记住「我已经说过一遍了，别再说」。  
   3. **训练数据里就有重复**：训练语料里本身就有「同一段意思换句话再说一遍」或列表、条款重复等，模型会学到「可以这样收尾」；长回复 + 弱重复惩罚，就容易在结尾再「收尾」一次，变成两段相同或几乎相同。
 
-所以「上下文一大，更容易产生同一段内容」的底层原因可以概括成：**生成是局部依赖、按概率采样；上下文长了以后，注意力更偏向近期内容，且同一句话在上下文里已经出现，再被采样的概率仍在，就容易在结尾再生成一段相同或几乎相同的话**。桥的去重是在**结果上**兜底，根本缓解仍是：缩短上下文（少带历史轮次）或依赖上游/模型侧的重复惩罚。
+所以「上下文一大，更容易产生同一段内容」的底层原因可以概括成：**生成是局部依赖、按概率采样；上下文长了以后，注意力更偏向近期内容，且同一句话在上下文里已经出现，再被采样的概率仍在，就容易在结尾再生成一段相同或几乎相同的话**。根本缓解仍是：缩短上下文（少带历史轮次）或依赖上游/模型侧（Cursor Agent）的重复惩罚或产品修复。
 
-### 3.2 流式时怎么判断「会有重复」？
+### 3.2 流式解析器当前行为
 
-流式是**边收边转发**，不能等整段结束再一次性判断，只能**边累积边看**：
+桥的流式解析（`stream-parser.js`）**不做任何去重**：收到 cursor-agent 的 NDJSON 行后，仅做「抽取文本 + 过滤 thinking/心跳」后原样转为 SSE 转发。若 Cursor Agent 输出两遍，界面就会显示两遍。
 
-- **思路**：在桥里维护「已转发给客户端的助理文本」`accumulatedText`。每收到 cursor-agent 的一小块 delta（如一行 NDJSON 里的 `message.content[].text`），先拼成 `next = accumulatedText + 本块`，再检查 `next` 是否等于「同一段写两遍」（即 `next.slice(0, half) === next.slice(half)`）。
-- **若发现重复**：说明当前块正在写「第二遍」。此时只把「还属于第一遍」的那一段转发出去（即只转发到第一遍结束为止），之后本回复的后续块都不再转发，客户端就只会看到一遍。
-- **实现位置**：在 `stream-parser.js` 的 `createStreamParser` 里，对每块在 push 前做上述判断；若 `wouldBeDuplicated(accumulatedText, text)` 为 true，则只 push 补全第一段的那部分内容，并设 `dedupeStopped`，后续块一律不再转发。
+**仍保留**：**过滤思考/心跳指令**——顶层或 content 里 `type: thinking/reasoning` 默认不抽取；模型内部思考及心跳相关指令经过滤后不转发；纯心跳回复 "HEARTBEAT_OK" 仍会正常显示。**可选**：在 `.env` 中设 **`CURSOR_STREAM_SHOW_THINKING=1`**（或 `true`）可打开 thinking/reasoning 的展示。
 
-这样流式下也能在「整段重复」出现时只保留第一段，和当前非流式的 `dedupeRepeatedContent` 行为一致；若重复边界刚好落在某一块中间，会尽量只截出「第一段」的那一段再转发，避免把第一段截断。
+**若出现「两条独立气泡」**：两条气泡通常说明客户端发了**两次请求**或渲染创建了多条消息。排查：看桥终端是否有两次 `runAgentStream start`。
+
+### 3.3 是否该在「上游」修？如何单测 Cursor Agent？
+
+**结论**：若 Cursor Agent 本身在一条流里就输出两遍，需在 **Cursor Agent / Cursor 产品侧** 排查并修复；桥已不做去重。
+
+**单测 Cursor Agent（不走桥）**：用仓库内脚本直接跑一次 Agent，看原始 stdout 是否已经重复：
+
+```bash
+cd /path/to/cursor-bridge
+node scripts/check-agent-raw-output.mjs
+```
+
+脚本会用与桥相同的参数调用 `cursor-agent`（prompt 为 `[User]\n你是什么模型`），把原始 NDJSON 写入 `.cursor-agent-raw-stdout.txt`，并打印「原始 stdout 中回复是否出现同一段两遍：是/否」。**实际跑过后的结论**：在仅发一条「你是什么模型」、无桥无 OpenClaw 的情况下，Cursor Agent 的**原始输出里就已经出现同一段两遍**，说明重复来自 **Cursor Agent / Cursor 产品侧**，不是 OpenClaw 或桥引入的。
+
+**根因在 Cursor 侧**：这是 Cursor Agent 的已知行为/ bug，社区有多人反馈「Agent 流式输出同一句重复多遍」或「Agent stream bug」。桥已**不做去重**，无法从 OpenClaw 或工作区 prompt 里根本修掉，需 Cursor 产品侧修复。
+
+**Cursor 侧可尝试的缓解**（来自社区，非官方保证）：
+- 关闭 MCP：Cursor 设置 → Tools & MCP，暂时禁用所有 MCP 后重启 Cursor，再试一次 Agent/stream。
+- 清全局状态：删除 `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` 后重启（会清掉部分本地状态）。
+- 升级或降级 Cursor 版本后重试（有用户反馈不同版本表现不同）。
+
+**参考**：Cursor 论坛 [Agent just repeats same sentence again and again](https://forum.cursor.com/t/agent-just-repeates-same-sentence-again-and-again/128285)、[Agent stream bug](https://forum.cursor.com/t/agent-stream-bug/151533)。若仍复现，建议在 Cursor 论坛发帖或向 Cursor 官方反馈，以便产品侧修复。

@@ -87,17 +87,6 @@ function debugDumpPrompt(prompt, label) {
   console.log('[bridge] prompt 头尾预览:\n%s%s%s', head, mid, tail);
 }
 
-/** 若内容为完全相同（或仅空白差异）的两段拼接（模型重复输出），只保留一段 */
-function dedupeRepeatedContent(s) {
-  if (typeof s !== 'string' || s.length < 2) return s;
-  const half = Math.floor(s.length / 2);
-  const first = s.slice(0, half);
-  const second = s.slice(half);
-  if (first === second) return first;
-  if (first.trim() === second.trim()) return first.trimEnd().length < first.length ? first.trimEnd() : first;
-  return s;
-}
-
 /** 健康检查：cursor-agent 是否可用且已登录 */
 function checkCursorAgent() {
   if (process.env.NODE_ENV === 'test') return Promise.resolve({ ok: true });
@@ -273,7 +262,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        const content = dedupeRepeatedContent(result.content != null ? String(result.content) : '');
+        const content = result.content != null ? String(result.content) : '';
         if (process.env.NODE_ENV !== 'test') {
           if (content.length === 0) {
             console.warn('[bridge] [%s] /v1/chat/completions 200 但 content 为空，界面会无回复。', id);
@@ -340,15 +329,26 @@ const server = http.createServer(async (req, res) => {
     const meta = { id, created, model: MODEL_ID };
     const parser = createStreamParser(meta);
     let ended = false;
+    let streamTimeoutId = null;
     const finish = () => {
       if (ended) return;
       ended = true;
+      if (streamTimeoutId) clearTimeout(streamTimeoutId);
+      streamTimeoutId = null;
       kill();
       try {
         res.write('data: [DONE]\n\n');
         res.end();
       } catch (_) {}
     };
+
+    streamTimeoutId = setTimeout(() => {
+      if (ended) return;
+      if (process.env.NODE_ENV !== 'test') {
+        console.warn('[bridge] [%s] 流式超时（%dms），强制结束并发送 [DONE]', id, CURSOR_AGENT_TIMEOUT_MS);
+      }
+      finish();
+    }, CURSOR_AGENT_TIMEOUT_MS);
 
     agentStream.on('error', (err) => {
       try {
@@ -491,7 +491,7 @@ const server = http.createServer(async (req, res) => {
       sendError(res, status, result.error || 'cursor-agent failed', code);
       return;
     }
-    const assistantText = dedupeRepeatedContent(result.content != null ? String(result.content) : '');
+    const assistantText = result.content != null ? String(result.content) : '';
     if (process.env.NODE_ENV !== 'test') {
       console.log('[bridge] /v1/responses 200, content length:', assistantText.length, assistantText.slice(0, 80) ? `preview: ${assistantText.slice(0, 80)}...` : '(empty)');
     }

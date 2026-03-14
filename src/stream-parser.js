@@ -1,20 +1,64 @@
 /**
  * 将 cursor-agent stream-json 的 NDJSON 行解析为 OpenAI 风格的 SSE 事件内容。
  * 支持 type: assistant | result | message 及顶层 output/content/text，与 agent-runner 解析逻辑对齐。
+ * 过滤「思考/心跳指令」类内容，不展示给用户；可通过 CURSOR_STREAM_SHOW_THINKING=1 打开 thinking/reasoning 显示。
+ * 对 Cursor 的 stream-json 语义做消费修正：stream-partial-output 下，partial assistant 已流出后，
+ * 若后面又补发完整 assistant / result，不再重复转发，避免界面出现两遍相同回复。
  */
 
 import { Transform } from 'stream';
 
-/** 从单行 JSON 对象中抽出要作为 delta.content 的文本，与 agent-runner 的提取逻辑一致 */
+/** 为 1 或 true 时，流式输出中保留 thinking/reasoning 内容（默认不保留） */
+const SHOW_THINKING = process.env.CURSOR_STREAM_SHOW_THINKING === '1' || process.env.CURSOR_STREAM_SHOW_THINKING === 'true';
+
+/** 仅心跳相关：始终过滤，不展示给用户 */
+function isLikelyHeartbeat(text) {
+  if (!text || typeof text !== 'string') return true;
+  const t = text.trim();
+  if (!t) return true;
+  if (t.includes('Read HEARTBEAT.md') || t.includes('read HEARTBEAT.md')) return true;
+  if (t.includes('Follow it strictly')) return true;
+  if (t.includes('Current time:') && t.length < 120) return true;
+  if (t.includes('Do not infer or repeat old tasks from prior chats')) return true;
+  if (t.includes('use workspace file') && t.includes('HEARTBEAT.md')) return true;
+  return false;
+}
+
+/** 模型内部思考类文案（仅当未开启 SHOW_THINKING 时过滤） */
+function isLikelyThinkingOnly(text) {
+  if (!text || typeof text !== 'string') return true;
+  const t = text.trim();
+  if (!t) return true;
+  const lower = t.toLowerCase();
+  if (lower.startsWith('the user is asking') || lower.startsWith('the user is sending')) return true;
+  if (t.includes('from the openclaw-control-ui') && (t.includes('message') || t.includes('test') || t.includes('I should respond') || t.includes('persona'))) return true;
+  if (t.includes('I should respond') || t.includes('as the Xiao Li persona') || t.includes("they're just saying")) return true;
+  if (t.includes('There\'s no heartbeat instruction') || t.includes('I\'ll keep it short and natural')) return true;
+  if (t.length > 80 && (lower.includes('this is a simple') || lower.includes('acknowledging the test'))) return true;
+  return false;
+}
+
+/** 判断是否应过滤不展示：心跳始终过滤；thinking 仅在未开启 CURSOR_STREAM_SHOW_THINKING 时过滤 */
+function isLikelyThinkingOrHeartbeat(text) {
+  if (isLikelyHeartbeat(text)) return true;
+  if (!SHOW_THINKING && isLikelyThinkingOnly(text)) return true;
+  return false;
+}
+
+/** 从单行 JSON 对象中抽出要作为 delta.content 的文本。未开启 CURSOR_STREAM_SHOW_THINKING 时不抽取 thinking/reasoning 类。 */
 function extractTextFromStreamLine(obj) {
   if (!obj || typeof obj !== 'object') return '';
+  const t = (obj.type || '').toString().toLowerCase();
+  if (!SHOW_THINKING && (t === 'thinking' || t === 'reasoning' || t === 'thought')) return '';
 
   // type === 'assistant'：message.content 数组或字符串
   if (obj.type === 'assistant' && obj.message) {
     const content = obj.message.content;
     if (typeof content === 'string' && content.trim()) return content;
     if (Array.isArray(content)) {
-      const parts = content.map((c) => (c && typeof c.text === 'string' ? c.text : (c && typeof c.content === 'string' ? c.content : '')) || '');
+      const parts = content
+        .filter((c) => { if (SHOW_THINKING) return true; const typ = (c && (c.type || '').toString().toLowerCase()) || ''; return typ !== 'thinking' && typ !== 'reasoning'; })
+        .map((c) => (c && typeof c.text === 'string' ? c.text : (c && typeof c.content === 'string' ? c.content : '')) || '');
       const s = parts.join('').trim();
       if (s) return s;
     }
@@ -35,7 +79,9 @@ function extractTextFromStreamLine(obj) {
     const content = obj.content ?? obj.message?.content ?? obj.text;
     if (typeof content === 'string' && content.trim()) return content;
     if (Array.isArray(content)) {
-      const parts = content.map((c) => (c && typeof c.text === 'string' ? c.text : (c && typeof c.content === 'string' ? c.content : '')) || '');
+      const parts = content
+        .filter((c) => { if (SHOW_THINKING) return true; const typ = (c && (c.type || '').toString().toLowerCase()) || ''; return typ !== 'thinking' && typ !== 'reasoning'; })
+        .map((c) => (c && typeof c.text === 'string' ? c.text : (c && typeof c.content === 'string' ? c.content : '')) || '');
       const s = parts.join('').trim();
       if (s) return s;
     }
@@ -50,6 +96,10 @@ function extractTextFromStreamLine(obj) {
   }
 
   return '';
+}
+
+function normalizeForCompare(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -68,6 +118,7 @@ export function parseNdjsonLine(line, meta) {
 
   const text = extractTextFromStreamLine(obj);
   if (!text) return null;
+  if (isLikelyThinkingOrHeartbeat(text)) return null;
 
   const chunk = {
     id: meta.id,
@@ -85,96 +136,80 @@ export function parseNdjsonLine(line, meta) {
   return JSON.stringify(chunk);
 }
 
-/** 若 accumulated + newText 形成「完全相同两段」，返回 false 表示不要转发 newText（并之后都不要再转发） */
-function wouldBeDuplicated(accumulated, newText) {
-  const next = accumulated + newText;
-  if (next.length < 2) return false;
-  const half = Math.floor(next.length / 2);
-  return next.slice(0, half) === next.slice(half);
-}
-
 /**
  * 创建一个 Transform 流：输入为 NDJSON 行（Buffer/string），输出为 SSE 格式的字符串（data: {...}\n\n）。
- * 会做「整段重复」检测：若已转发的文本与即将转发的拼接后是 A+A，则不再转发后续内容（避免界面出现两遍相同回复）。
+ * 不做去重，原样转发 cursor-agent 的输出（仅过滤 thinking/心跳）。
  * @param {object} meta { id, created, model }
  * @returns {Transform}
  */
 export function createStreamParser(meta) {
   let buffer = '';
-  let accumulatedText = '';
-  let dedupeStopped = false;
+  let streamedAssistantText = '';
 
   return new Transform({
     objectMode: false,
     transform(chunk, encoding, callback) {
-      if (dedupeStopped) {
-        callback();
-        return;
-      }
       buffer += chunk.toString();
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
 
       for (const line of lines) {
-        const data = parseNdjsonLine(line.trim(), meta);
-        if (data) {
-          let text = '';
-          try {
-            const payload = JSON.parse(data);
-            text = payload.choices?.[0]?.delta?.content ?? '';
-          } catch (_) {}
-          if (text && wouldBeDuplicated(accumulatedText, text)) {
-            const next = accumulatedText + text;
-            const half = Math.floor(next.length / 2);
-            const toSend = half - accumulatedText.length;
-            if (toSend > 0) {
-              const partial = JSON.stringify({
-                id: meta.id,
-                object: 'chat.completion.chunk',
-                created: meta.created,
-                model: meta.model,
-                choices: [{ index: 0, delta: { role: 'assistant', content: text.slice(0, toSend) }, finish_reason: null }],
-              });
-              this.push(`data: ${partial}\n\n`);
-            }
-            dedupeStopped = true;
-            break;
-          }
-          if (text) accumulatedText += text;
-          this.push(`data: ${data}\n\n`);
+        if (!line.trim()) continue;
+        let obj;
+        try {
+          obj = JSON.parse(line.trim());
+        } catch (_) {
+          continue;
         }
+
+        const text = extractTextFromStreamLine(obj);
+        if (!text) continue;
+        if (isLikelyThinkingOrHeartbeat(text)) continue;
+
+        const kind = String(obj.type || '').toLowerCase();
+        const normalizedText = normalizeForCompare(text);
+        const normalizedAccumulated = normalizeForCompare(streamedAssistantText);
+
+        // Cursor 在 --stream-partial-output 下会先发 partial assistant，再补发一次完整 assistant，
+        // 最后 result 再给一遍完整文本。partial 已转发后，后两者应视为收尾事件而非正文。
+        if ((kind === 'assistant' || kind === 'result') && normalizedAccumulated) {
+          if (normalizedText === normalizedAccumulated || normalizedText.startsWith(normalizedAccumulated)) {
+            continue;
+          }
+        }
+        if (kind === 'result' && normalizedAccumulated) continue;
+
+        const data = parseNdjsonLine(line.trim(), meta);
+        if (!data) continue;
+
+        if (kind === 'assistant') streamedAssistantText += text;
+        if (kind === 'result' && !streamedAssistantText) streamedAssistantText = text;
+        this.push(`data: ${data}\n\n`);
       }
       callback();
     },
     flush(callback) {
-      if (dedupeStopped) {
-        callback();
-        return;
-      }
-      if (buffer.trim() && !dedupeStopped) {
-        const data = parseNdjsonLine(buffer.trim(), meta);
-        if (data) {
-          let text = '';
-          try {
-            const payload = JSON.parse(data);
-            text = payload.choices?.[0]?.delta?.content ?? '';
-          } catch (_) {}
-          if (text && wouldBeDuplicated(accumulatedText, text)) {
-            const next = accumulatedText + text;
-            const half = Math.floor(next.length / 2);
-            const toSend = half - accumulatedText.length;
-            if (toSend > 0) {
-              const partial = JSON.stringify({
-                id: meta.id,
-                object: 'chat.completion.chunk',
-                created: meta.created,
-                model: meta.model,
-                choices: [{ index: 0, delta: { role: 'assistant', content: text.slice(0, toSend) }, finish_reason: null }],
-              });
-              this.push(`data: ${partial}\n\n`);
+      if (buffer.trim()) {
+        let obj;
+        try {
+          obj = JSON.parse(buffer.trim());
+        } catch (_) {
+          obj = null;
+        }
+        if (obj) {
+          const text = extractTextFromStreamLine(obj);
+          if (text && !isLikelyThinkingOrHeartbeat(text)) {
+            const kind = String(obj.type || '').toLowerCase();
+            const normalizedText = normalizeForCompare(text);
+            const normalizedAccumulated = normalizeForCompare(streamedAssistantText);
+            const isCompletionEcho =
+              normalizedAccumulated &&
+              (kind === 'assistant' || kind === 'result') &&
+              (normalizedText === normalizedAccumulated || normalizedText.startsWith(normalizedAccumulated));
+            if (!isCompletionEcho && !(kind === 'result' && normalizedAccumulated)) {
+              const data = parseNdjsonLine(buffer.trim(), meta);
+              if (data) this.push(`data: ${data}\n\n`);
             }
-          } else {
-            this.push(`data: ${data}\n\n`);
           }
         }
       }
