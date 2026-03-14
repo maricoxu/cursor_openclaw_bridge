@@ -10,6 +10,8 @@ import { Readable } from 'stream';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEBUG_STDOUT_FILE = path.resolve(__dirname, '..', '.cursor-bridge-last-stdout.txt');
+/** 与 server 一致：为 1/true 时打印调试日志 */
+const BRIDGE_DEBUG = /^(1|true|yes)$/i.test(process.env.CURSOR_BRIDGE_DEBUG || '');
 
 /**
  * 运行 cursor-agent 非流式，收集完整 stdout 后解析出 assistant 回复。
@@ -55,9 +57,9 @@ export function runAgent({ prompt, workspace, bin, timeoutMs, model, extraArgs, 
       try {
         const header = `--- cursor-agent stdout（${reason}） ${new Date().toISOString()} ---\n--- BEGIN STDOUT ---\n`;
         fs.writeFileSync(DEBUG_STDOUT_FILE, header + out + '\n--- END STDOUT ---\n', 'utf8');
-        console.warn('[agent-runner] 完整 stdout 已写入:', DEBUG_STDOUT_FILE);
+        if (BRIDGE_DEBUG) console.warn('[agent-runner] 完整 stdout 已写入:', DEBUG_STDOUT_FILE);
       } catch (e) {
-        console.warn('[agent-runner] 写入 stdout 文件失败:', e.message, '路径:', DEBUG_STDOUT_FILE);
+        if (BRIDGE_DEBUG) console.warn('[agent-runner] 写入 stdout 文件失败:', e.message, '路径:', DEBUG_STDOUT_FILE);
       }
     };
 
@@ -74,9 +76,7 @@ export function runAgent({ prompt, workspace, bin, timeoutMs, model, extraArgs, 
     };
 
     const t = setTimeout(() => {
-      if (process.env.NODE_ENV !== 'test') {
-        console.warn('[agent-runner] cursor-agent timeout, stdoutLen=%d, stderrLen=%d', (stdout && stdout.length) || 0, (stderr && stderr.length) || 0);
-      }
+      if (BRIDGE_DEBUG) console.warn('[agent-runner] cursor-agent timeout, stdoutLen=%d, stderrLen=%d', (stdout && stdout.length) || 0, (stderr && stderr.length) || 0);
       const timeoutErr = stderr.trim()
         ? `cursor-agent timeout. stderr: ${stderr.trim().slice(0, 500)}`
         : 'cursor-agent timeout';
@@ -108,9 +108,7 @@ export function runAgent({ prompt, workspace, bin, timeoutMs, model, extraArgs, 
 
       const errLower = stderr.toLowerCase();
       if (code !== 0) {
-        if (process.env.NODE_ENV !== 'test') {
-          console.warn('[agent-runner] cursor-agent exit code %s', code, stderr.trim() ? `stderr: ${stderr.trim().slice(0, 200)}` : '');
-        }
+        if (BRIDGE_DEBUG) console.warn('[agent-runner] cursor-agent exit code %s', code, stderr.trim() ? `stderr: ${stderr.trim().slice(0, 200)}` : '');
         if (stdout.trim()) writeStdoutFile(`exit code ${code}`, stdout);
         if (errLower.includes('not logged in') || errLower.includes('login')) {
           return resolve({
@@ -128,14 +126,14 @@ export function runAgent({ prompt, workspace, bin, timeoutMs, model, extraArgs, 
 
       const content = extractContentFromJson(stdout);
       const final = content !== undefined ? content : stdout.trim();
-      if (process.env.NODE_ENV !== 'test' && (final === '' || (content === undefined && stdout.length > 0))) {
-        const lineCount = stdout.trim().split('\n').filter(Boolean).length;
-        console.warn('[agent-runner] 未从 stdout 解析出 result，stdout 行数:', lineCount, '末行预览:', stdout.trim().slice(-300));
+      if ((final === '' || (content === undefined && stdout.length > 0))) {
         writeStdoutFile('content 为空', stdout);
+        if (BRIDGE_DEBUG) {
+          const lineCount = stdout.trim().split('\n').filter(Boolean).length;
+          console.warn('[agent-runner] 未从 stdout 解析出 result，stdout 行数:', lineCount, '末行预览:', stdout.trim().slice(-300));
+        }
       }
-      if (process.env.NODE_ENV !== 'test') {
-        console.log('[agent-runner] cursor-agent exit 0, contentLen=%d', final.length);
-      }
+      if (BRIDGE_DEBUG) console.log('[agent-runner] cursor-agent exit 0, contentLen=%d', final.length);
       resolve({
         ok: true,
         content: final,

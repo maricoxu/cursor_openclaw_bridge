@@ -158,13 +158,15 @@
 
 **典型现象 2：「天气怎么样」有回复、「你用的模型是什么」或「测试」无回复**：可能是第二句时 prompt 更大（带上前一轮历史）、agent 超时或输出格式不同；或短回复时 cursor-agent 用了别的 JSON 结构。桥已对顶层 `output`/`content`/`text` 做兜底。若仍无回复：看终端是否出现「content 为空」和 `[agent-runner] 未从 stdout 解析出 result` 的**末行预览**，把末行贴出来可再对格式做兼容。
 
+**调试日志**：默认不打印请求/响应等日志。排查时在 `.env` 或启动前设 **`CURSOR_BRIDGE_DEBUG=1`**（如 `CURSOR_BRIDGE_DEBUG=1 npm start`），即可看到 `[bridge] ... -> 200`、`runAgent start`、`runAgentStream start`、`[agent-runner]` 等调试信息。
+
 **200 有、但界面无回复时**：说明 prompt 已正确发给 cursor-agent（可用 `CURSOR_DEBUG_PROMPT=1` 看 `.cursor-bridge-last-prompt.txt`），但**我们没从 cursor-agent 的 stdout 里解析出文本**。此时只要发生「content 为空」，桥会把 **cursor-agent 的完整 stdout** 写入 **`.cursor-bridge-last-stdout.txt`**。该文件**只会在出现「无回复」的那次请求时生成**，且固定写在 **cursor-bridge 项目根目录**（与 `package.json` 同级），与从哪个目录执行 `npm start` 无关。若目录里没有该文件，说明自上次重启桥以来还没有触发过「200 但 content 为空」；再问一次「你是什么模型」等触发无回复后即可看到。
 
 **502 刷屏、OpenClaw 一直无回复**：桥会对**非流式** completions 做**串行化**（同一时间只跑一个 runAgent），避免多实例冲突和重复 502。若仍出现连续 502，看终端里的 `[bridge] [id] runAgent failed: …` 和 `[agent-runner] cursor-agent exit code …` 或 `cursor-agent timeout`，可判断是超时、非零退出还是未登录，再对症排查。
 
 **若错误信息含 `… is not available in the slow pool. Please switch to Auto`**：这是 Cursor 侧模型/配额限制，桥会返回 **503**、code `cursor_model_unavailable`。**推荐**：在 **cursor-bridge 的 `.env`** 里设 **`CURSOR_AGENT_MODEL=auto`**，桥会传 `--model auto` 给 cursor-agent，由 Cursor 自动选模型，省用量、避免 503；也可在 Cursor 设置里把默认模型改为 Auto。不要固定用 `claude-4.6-opus-high-thinking` 等贵模型跑简单对话。
 
-**若终端里只有 `[bridge] [id] POST /v1/chat/completions -> 200`、没有任何 `[agent-runner]` 或 `runAgent start`**：说明本次请求走的是**流式**（客户端发了 `stream: true`）。流式路径不会打 runAgent/agent-runner 的日志，且若 cursor-agent 的 stream-json 输出格式与解析器预期不一致，就可能 200 但无内容。可设置 **`CURSOR_FORCE_NON_STREAM=1`**（在 `.env` 里），桥会**内部**用 runAgent 非流式取回复，但若客户端请求的是 stream，桥仍会以 **SSE 单块**（一整段 content + [DONE]）回写，这样 OpenClaw 等只渲染流式响应的界面也能正常显示。
+**若开启 CURSOR_BRIDGE_DEBUG=1 后终端里只有 `[bridge] [id] POST /v1/chat/completions -> 200`、没有任何 `[agent-runner]` 或 `runAgent start`**：说明本次请求走的是**流式**（客户端发了 `stream: true`）。流式路径不会打 runAgent/agent-runner 的日志，且若 cursor-agent 的 stream-json 输出格式与解析器预期不一致，就可能 200 但无内容。可设置 **`CURSOR_FORCE_NON_STREAM=1`**（在 `.env` 里），桥会**内部**用 runAgent 非流式取回复，但若客户端请求的是 stream，桥仍会以 **SSE 单块**（一整段 content + [DONE]）回写，这样 OpenClaw 等只渲染流式响应的界面也能正常显示。
 
 **典型现象 3：只有第一条有回复，第二、三条是空气泡**：OpenClaw 每次请求都会带上整段历史（例如 30+ 条），第二句起 prompt 很大，cursor-agent 容易超时或产不出我们解析的 result，桥就回 200 但 content 为空。**处理办法**：用下面的 `CURSOR_MAX_MESSAGES` 限制条数。
 

@@ -35,6 +35,8 @@ npm start
 
 默认监听 `http://127.0.0.1:3847`。提供 `GET /health`、`GET /v1/models`（OpenAI 兼容模型列表，可减少控制台 404）、`POST /v1/chat/completions`。
 
+**调试日志**：默认不打印请求/响应等日志，以减少开销。需要排查时设置环境变量 `CURSOR_BRIDGE_DEBUG=1` 再启动（如 `CURSOR_BRIDGE_DEBUG=1 npm start`），即可看到每条请求的路径、状态码及 runAgent 等调试信息。
+
 ### 4. 验证
 
 ```bash
