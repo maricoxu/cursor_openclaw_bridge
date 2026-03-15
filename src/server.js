@@ -358,13 +358,18 @@ const server = http.createServer(async (req, res) => {
     const meta = { id, created, model: MODEL_ID };
     const parser = createStreamParser(meta);
     let ended = false;
+    let streamChunkCount = 0; // 实际推送过的 content 块数，用于诊断「什么都不输出」
     let streamTimeoutId = null;
+    parser.on('data', () => { streamChunkCount += 1; });
     const finish = () => {
       if (ended) return;
       ended = true;
       if (streamTimeoutId) clearTimeout(streamTimeoutId);
       streamTimeoutId = null;
       kill();
+      if (streamChunkCount === 0) {
+        console.warn('[bridge] [%s] 流式结束但未输出任何 content，界面可能无回复。常见原因：仅 heartbeat/thinking、或 agent 未产出 result 行。', id);
+      }
       try {
         res.write('data: [DONE]\n\n');
         res.end();

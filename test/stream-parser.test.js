@@ -85,7 +85,7 @@ function extractContentFromSSE(sseText) {
 }
 
 describe('createStreamParser', () => {
-  it('输入 NDJSON 行输出 SSE 行', (t) => {
+  it('输入 NDJSON 行输出 SSE 行（只推 result）', () => {
     return new Promise((resolve, reject) => {
       const parser = createStreamParser(meta);
       const chunks = [];
@@ -94,16 +94,11 @@ describe('createStreamParser', () => {
         const out = chunks.join('');
         assert.ok(out.startsWith('data: '));
         assert.ok(out.includes('"content":"x"'));
-        assert.ok(out.endsWith('\n\n') || out.includes('\n\n'));
         resolve();
       });
       parser.on('error', reject);
-      const line = JSON.stringify({
-        type: 'assistant',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'x' }] },
-      });
       const r = new Readable({ read() {} });
-      r.push(line + '\n');
+      r.push(JSON.stringify({ type: 'result', result: 'x' }) + '\n');
       r.push(null);
       r.pipe(parser);
     });
@@ -121,16 +116,15 @@ describe('createStreamParser', () => {
     assert.strictEqual(parsed.choices[0].delta.content, msg + msg);
   });
 
-  it('流式多行相同 result 事件级去重只保留一遍', () => {
+  it('流式多行 result 每行都转发（无去重）', () => {
     const msg = '你好';
     return new Promise((resolve, reject) => {
       const parser = createStreamParser(meta);
       const chunks = [];
       parser.on('data', (c) => chunks.push(c.toString()));
       parser.on('end', () => {
-        const sseText = chunks.join('');
-        const content = extractContentFromSSE(sseText);
-        assert.strictEqual(content, msg, '相同 result 多行只转发第一行');
+        const content = extractContentFromSSE(chunks.join(''));
+        assert.strictEqual(content, msg + msg, '两行 result 都转发');
         resolve();
       });
       parser.on('error', reject);
@@ -143,7 +137,7 @@ describe('createStreamParser', () => {
     });
   });
 
-  it('真实 Cursor partial + 完整 assistant + result 时事件级去重只出一遍正文', () => {
+  it('assistant 多段 + result 时只出 result 正文', () => {
     const part1 = '\n我是 **Auto**';
     const part2 = '，由 Cursor 设计';
     const part3 = '的 **Agent 路由器**，负责理解你的需求并调度合适的工具与能力来协助你。\n\n如果你有具体问题或想做的事，可以直接说，我会用中文和你一起解决。';
@@ -156,7 +150,7 @@ describe('createStreamParser', () => {
       parser.on('end', () => {
         const sseText = chunks.join('');
         const content = extractContentFromSSE(sseText);
-        assert.strictEqual(content, full, 'partial 拼出 full 后，完整 assistant 与 result 视为冗余只出一遍');
+        assert.strictEqual(content, full, '只推 result，assistant 不转发');
         resolve();
       });
       parser.on('error', reject);
@@ -175,7 +169,7 @@ describe('createStreamParser', () => {
     });
   });
 
-  it('result 先到、assistant 后到同一段正文时只出一遍', () => {
+  it('result 先到、assistant 后到：只出 result', () => {
     const full = '我是小哩——你笔记库里的中枢之魂。';
     const part1 = '我是小哩';
     const part2 = '——你笔记库里的中枢之魂。';
@@ -184,9 +178,8 @@ describe('createStreamParser', () => {
       const chunks = [];
       parser.on('data', (c) => chunks.push(c.toString()));
       parser.on('end', () => {
-        const sseText = chunks.join('');
-        const content = extractContentFromSSE(sseText);
-        assert.strictEqual(content, full, 'result 先发整段再 assistant 分片时，分片视为冗余只出一遍');
+        const content = extractContentFromSSE(chunks.join(''));
+        assert.strictEqual(content, full, '只推 result');
         resolve();
       });
       parser.on('error', reject);
@@ -202,7 +195,7 @@ describe('createStreamParser', () => {
     });
   });
 
-  it('result 与 message(role=assistant) 同一段正文时只出一遍', () => {
+  it('result 与 message 同段时只出 result', () => {
     const full = '回复正文只出一遍。';
     return new Promise((resolve, reject) => {
       const parser = createStreamParser(meta);
@@ -226,7 +219,7 @@ describe('createStreamParser', () => {
     });
   });
 
-  it('result 先到、assistant 单字/短 chunk 后到时只出一遍（防短 chunk 漏去重）', () => {
+  it('result 先到、assistant 短 chunk 后到：只出 result', () => {
     const full = '你好世界';
     return new Promise((resolve, reject) => {
       const parser = createStreamParser(meta);
@@ -252,26 +245,20 @@ describe('createStreamParser', () => {
     });
   });
 
-  it('两行完全相同 assistant 全文时只出一遍', () => {
+  it('仅 assistant 无 result 时出兜底', () => {
     const full = '完全相同的两行只出一遍。';
     return new Promise((resolve, reject) => {
       const parser = createStreamParser(meta);
       const chunks = [];
       parser.on('data', (c) => chunks.push(c.toString()));
       parser.on('end', () => {
-        const sseText = chunks.join('');
-        const content = extractContentFromSSE(sseText);
-        assert.strictEqual(content, full, '相同 assistant 多行只转发第一行');
+        const content = extractContentFromSSE(chunks.join(''));
+        assert.ok(content.includes('无可展示内容') || content.includes('heartbeat') || content.includes('thinking'), '仅 assistant 无 result 时应出兜底');
         resolve();
       });
       parser.on('error', reject);
-      const line = JSON.stringify({
-        type: 'assistant',
-        message: { role: 'assistant', content: [{ type: 'text', text: full }] },
-      });
       const r = new Readable({ read() {} });
-      r.push(line + '\n');
-      r.push(line + '\n');
+      r.push(JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: full }] } }) + '\n');
       r.push(null);
       r.pipe(parser);
     });
@@ -320,27 +307,119 @@ describe('createStreamParser', () => {
     });
   });
 
-  it('真实场景：两条 assistant 均为同一条长段落时只出一遍', () => {
-    const full =
-      '我这边看不到当前对话具体用的是哪个模型。原因: 我是 Cursor 的 Auto, 只做请求路由。若要在 UI 里显示当前模型需在 openclaw 选模型/发请求逻辑里读出模型名。';
+  it('仅 assistant 多段无 result 时出兜底', () => {
     return new Promise((resolve, reject) => {
       const parser = createStreamParser(meta);
       const chunks = [];
       parser.on('data', (c) => chunks.push(c.toString()));
       parser.on('end', () => {
-        const sseText = chunks.join('');
-        const content = extractContentFromSSE(sseText);
-        assert.strictEqual(content, full, '两条 assistant 同内容应只出一遍');
+        const content = extractContentFromSSE(chunks.join(''));
+        assert.ok(content.includes('无可展示内容') || content.includes('thinking'), '仅 assistant 无 result 时出兜底');
         resolve();
       });
       parser.on('error', reject);
-      const line = JSON.stringify({
-        type: 'assistant',
-        message: { role: 'assistant', content: [{ type: 'text', text: full }] },
-      });
+      const lines = [
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'A' }] } }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'AB' }] } }),
+      ];
       const r = new Readable({ read() {} });
-      r.push(line + '\n');
-      r.push(line + '\n');
+      for (const line of lines) r.push(line + '\n');
+      r.push(null);
+      r.pipe(parser);
+    });
+  });
+
+  it('仅 assistant 多段无 result 时出兜底（多段）', () => {
+    const a = '问1：什么是更好的？';
+    const ab = a + '问2：当前痛点？';
+    const abc = ab + '问3：硬约束？';
+    return new Promise((resolve, reject) => {
+      const parser = createStreamParser(meta);
+      const chunks = [];
+      parser.on('data', (c) => chunks.push(c.toString()));
+      parser.on('end', () => {
+        const content = extractContentFromSSE(chunks.join(''));
+        assert.ok(content.includes('无可展示内容') || content.includes('thinking'), '仅 assistant 无 result 时出兜底');
+        resolve();
+      });
+      parser.on('error', reject);
+      const lines = [
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: a }] } }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: ab }] } }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: abc }] } }),
+      ];
+      const r = new Readable({ read() {} });
+      for (const line of lines) r.push(line + '\n');
+      r.push(null);
+      r.pipe(parser);
+    });
+  });
+});
+
+/** 流式兜底：无 result 时推解析异常或无可展示内容 */
+describe('流式兜底与仅 result 推送', () => {
+  it('流式 0 输出：仅非法 JSON 时推一条「解析异常」提示', () => {
+    return new Promise((resolve, reject) => {
+      const parser = createStreamParser(meta);
+      const chunks = [];
+      parser.on('data', (c) => chunks.push(c.toString()));
+      parser.on('end', () => {
+        const content = extractContentFromSSE(chunks.join(''));
+        assert.ok(content.includes('解析异常') || content.includes('未得到可展示内容'), '应收到解析异常类兜底提示');
+        resolve();
+      });
+      parser.on('error', reject);
+      const r = new Readable({ read() {} });
+      r.push('not json\n');
+      r.push('{"type":"user"}\n');
+      r.push('{broken\n');
+      r.push(null);
+      r.pipe(parser);
+    });
+  });
+
+  it('流式 0 输出：仅有 thinking/heartbeat 时推一条「无可展示内容」提示', () => {
+    return new Promise((resolve, reject) => {
+      const parser = createStreamParser(meta);
+      const chunks = [];
+      parser.on('data', (c) => chunks.push(c.toString()));
+      parser.on('end', () => {
+        const content = extractContentFromSSE(chunks.join(''));
+        assert.ok(content.includes('无可展示内容') || content.includes('heartbeat') || content.includes('thinking'), '应收到无可展示内容类兜底提示');
+        resolve();
+      });
+      parser.on('error', reject);
+      const lines = [
+        JSON.stringify({ type: 'thinking', content: 'The user is asking something.' }),
+        JSON.stringify({ type: 'reasoning', content: 'I should respond as the Xiao Li persona.' }),
+      ];
+      const r = new Readable({ read() {} });
+      for (const line of lines) r.push(line + '\n');
+      r.push(null);
+      r.pipe(parser);
+    });
+  });
+
+  it('长文本「已发包含当前行」：当前行为已发内容的子串应整行跳过', () => {
+    const full = '我这边看不到当前对话具体用的是哪个模型。若要在 openclaw 里显示当前模型需在选模型/发请求逻辑里读出模型名。';
+    const substring = '若要在 openclaw 里显示当前模型需在选模型/发请求逻辑里读出模型名。';
+    return new Promise((resolve, reject) => {
+      const parser = createStreamParser(meta);
+      const chunks = [];
+      parser.on('data', (c) => chunks.push(c.toString()));
+      parser.on('end', () => {
+        const content = extractContentFromSSE(chunks.join(''));
+        assert.strictEqual(content, full, '只应出 result 整段');
+        assert.strictEqual(content.split(substring).length, 2, '子串只作为整段的一部分出现一次');
+        resolve();
+      });
+      parser.on('error', reject);
+      const lines = [
+        JSON.stringify({ type: 'result', result: full }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: substring }] } }),
+      ];
+      const r = new Readable({ read() {} });
+      for (const line of lines) r.push(line + '\n');
       r.push(null);
       r.pipe(parser);
     });

@@ -20,7 +20,7 @@ const streamReply = isWeather
   : '收到，测试通过。连接正常。有什么需要帮忙的吗？';
 
 if (isStream) {
-  // 流式：多行 NDJSON，每行 type assistant + message.content
+  // 流式：先可选的 assistant 块（桥当前只推 result，不转发），最后必发 type=result 整段
   const chars = streamReply.split('');
   for (let i = 0; i < chars.length; i++) {
     const line = JSON.stringify({
@@ -29,6 +29,8 @@ if (isStream) {
     });
     process.stdout.write(line + '\n');
   }
+  const resultLine = JSON.stringify({ type: 'result', result: streamReply });
+  process.stdout.write(resultLine + '\n');
 } else {
   // 非流式：单行 JSON，与 agent-runner extractContentFromJson 兼容
   const line = JSON.stringify({ type: 'result', result: nonStreamReply });

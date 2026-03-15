@@ -1,14 +1,26 @@
 /**
  * 将 cursor-agent stream-json 的 NDJSON 行解析为 OpenAI 风格的 SSE 事件内容。
  * 仅用于流式响应（客户端 stream: true 时）；非流式走 agent-runner 聚合 stdout，不经本模块。
- * 仅处理 type：assistant、result；兼容 type: message（role=assistant）。不处理兜底顶层 output/content/text。
- * 事件级去重：同一段正文只出一遍（result/assistant/message 重复、短 chunk 等均跳过）。
+ * 策略：不转发 assistant/message；只推送 type=result 整段作为最终输出。若开启 CURSOR_STREAM_SHOW_THINKING，
+ * 则 type=thinking/reasoning/thought 会作为「前期输出」先推（可配前缀），result 再作为诊断/最终输出，体感更连贯。
  */
 
 import { Transform } from 'stream';
 
-/** 为 1 或 true 时，流式输出中保留 thinking/reasoning 内容（默认不保留） */
+/** 为 1 或 true 时，流式输出中保留 thinking/reasoning 内容（默认不保留），并作为「前期输出」先推，result 再作为最终输出 */
 const SHOW_THINKING = process.env.CURSOR_STREAM_SHOW_THINKING === '1' || process.env.CURSOR_STREAM_SHOW_THINKING === 'true';
+/** thinking 块前加的前缀，便于和最终 result 区分；空则不加 */
+const THINKING_PREFIX = typeof process.env.CURSOR_STREAM_THINKING_PREFIX === 'string' ? process.env.CURSOR_STREAM_THINKING_PREFIX : '思考：';
+
+/** 为 1 或 true 时，打印每行 type/长度，便于排查 */
+const STREAM_DEBUG = /^(1|true|yes)$/i.test(process.env.CURSOR_BRIDGE_DEBUG || '');
+
+/** 超时未收到 result/thinking 时先推的提示：毫秒数，0 或未设则关闭 */
+const WAITING_MSG_AFTER_MS = Math.max(0, parseInt(process.env.CURSOR_STREAM_WAITING_MSG_AFTER_MS || '0', 10) || 0);
+/** 超时提示文案，可被 CURSOR_STREAM_WAITING_MSG_TEXT 覆盖 */
+const WAITING_MSG_TEXT = typeof process.env.CURSOR_STREAM_WAITING_MSG_TEXT === 'string'
+  ? process.env.CURSOR_STREAM_WAITING_MSG_TEXT
+  : '处理时间较长，请稍候。';
 
 /** 仅心跳相关：始终过滤，不展示给用户 */
 function isLikelyHeartbeat(text) {
@@ -50,7 +62,6 @@ function extractTextFromStreamLine(obj) {
   const t = (obj.type || '').toString().toLowerCase();
   if (!SHOW_THINKING && (t === 'thinking' || t === 'reasoning' || t === 'thought')) return '';
 
-  // type === 'assistant'：message.content 数组或字符串
   if (obj.type === 'assistant' && obj.message) {
     const content = obj.message.content;
     if (typeof content === 'string' && content.trim()) return content;
@@ -63,7 +74,6 @@ function extractTextFromStreamLine(obj) {
     }
   }
 
-  // type === 'result'：仅取 result（与官方 doc 一致；不读 output/content/text 避免与其它行重复）
   if (obj.type === 'result') {
     const r = obj.result;
     if (typeof r === 'string' && r.trim()) return r;
@@ -73,7 +83,6 @@ function extractTextFromStreamLine(obj) {
     }
   }
 
-  // type === 'message' 且 role 为 assistant（兼容旧版或变体格式，官方 doc 仅列 assistant/result）
   if (obj.type === 'message' && String((obj.role || obj.message?.role) || '').toLowerCase() === 'assistant') {
     const content = obj.content ?? obj.message?.content ?? obj.text;
     if (typeof content === 'string' && content.trim()) return content;
@@ -86,19 +95,30 @@ function extractTextFromStreamLine(obj) {
     }
   }
 
+  if (t === 'thinking' || t === 'reasoning' || t === 'thought') {
+    const c = obj.content ?? obj.text ?? '';
+    return (typeof c === 'string' ? c : '').trim();
+  }
+
   return '';
 }
 
-/** 仅用于事件级去重时的比较：空白规整后 trim，避免空格/换行差异导致误判 */
-function normalizeForEchoCheck(text) {
-  return String(text || '').replace(/\s+/g, ' ').trim();
+/** 拼出 OpenAI chunk 字符串 */
+function buildChunkWithContent(meta, content) {
+  const chunk = {
+    id: meta.id,
+    object: 'chat.completion.chunk',
+    created: meta.created,
+    model: meta.model,
+    choices: [
+      { index: 0, delta: { role: 'assistant', content }, finish_reason: null },
+    ],
+  };
+  return JSON.stringify(chunk);
 }
 
 /**
- * 将 NDJSON 行转成 OpenAI chat completion chunk 的 data 行（不含 "data: " 前缀，不含 \n\n）。
- * @param {string} line
- * @param {object} meta { id, created, model }
- * @returns {string | null} 若无需发送则返回 null
+ * 将 NDJSON 行转成 OpenAI chat completion chunk 的 data 行（供 parseNdjsonLine 等非流式用）。
  */
 export function parseNdjsonLine(line, meta) {
   let obj;
@@ -118,106 +138,119 @@ export function parseNdjsonLine(line, meta) {
     created: meta.created,
     model: meta.model,
     choices: [
-      {
-        index: 0,
-        delta: { role: 'assistant', content: text },
-        finish_reason: null,
-      },
+      { index: 0, delta: { role: 'assistant', content: text }, finish_reason: null },
     ],
   };
   return JSON.stringify(chunk);
 }
 
+const FALLBACK_PARSE_ERROR = '输出解析异常，未得到可展示内容。';
+const FALLBACK_NO_CONTENT = '无可展示内容（可能仅为 heartbeat/thinking），请重试或检查 Cursor Agent。';
+
 /**
- * 创建一个 Transform 流：输入为 NDJSON 行（Buffer/string），输出为 SSE 格式的字符串（data: {...}\n\n）。
- * 仅过滤 thinking/心跳；事件级去重：与已转发内容完全相同的 assistant/result 行只转发一次。
- * @param {object} meta { id, created, model }
- * @returns {Transform}
+ * 创建 Transform 流：只转发 type=result 的整段正文，不转发 assistant/message。
+ * 无去重逻辑；若始终没有 result，在 flush 时推兜底文案。
+ * 可选：CURSOR_STREAM_WAITING_MSG_AFTER_MS > 0 时，超时未收到任何可展示内容则先推「处理时间较长，请稍候」类提示。
  */
 export function createStreamParser(meta) {
   let buffer = '';
-  /** 已通过 SSE 转发的 assistant 内容拼接，仅用于事件级去重判断，不参与 parseNdjsonLine */
-  let streamedText = '';
+  let sawNonEmptyLine = false;
+  let sawParseError = false;
+  let pushedAnyContent = false;
+  let waitingTimer = null;
+
+  function clearWaitingTimer() {
+    if (waitingTimer != null) {
+      clearTimeout(waitingTimer);
+      waitingTimer = null;
+    }
+  }
+
+  function maybeStartWaitingTimer(transform) {
+    if (WAITING_MSG_AFTER_MS <= 0 || waitingTimer != null || pushedAnyContent) return;
+    waitingTimer = setTimeout(() => {
+      waitingTimer = null;
+      if (pushedAnyContent) return;
+      const msg = (WAITING_MSG_TEXT && WAITING_MSG_TEXT.trim()) ? WAITING_MSG_TEXT.trim() : '处理时间较长，请稍候。';
+      transform.push(`data: ${buildChunkWithContent(meta, msg)}\n\n`);
+      pushedAnyContent = true;
+    }, WAITING_MSG_AFTER_MS);
+  }
 
   return new Transform({
     objectMode: false,
     transform(chunk, encoding, callback) {
+      maybeStartWaitingTimer(this);
       buffer += chunk.toString();
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
 
       for (const line of lines) {
         if (!line.trim()) continue;
+        sawNonEmptyLine = true;
         let obj;
         try {
           obj = JSON.parse(line.trim());
         } catch (_) {
+          sawParseError = true;
           continue;
         }
+        const kind = String(obj.type || '').toLowerCase();
         const text = extractTextFromStreamLine(obj);
+        const isThinking = kind === 'thinking' || kind === 'reasoning' || kind === 'thought';
+        if (STREAM_DEBUG && (kind === 'assistant' || kind === 'result' || kind === 'message' || isThinking)) {
+          const snippet = text ? text.replace(/\s+/g, ' ').trim().slice(0, 55) + (text.length > 55 ? '…' : '') : '-';
+          console.log('[stream-raw] type=%s textLen=%d snippet=%s', kind, text?.length ?? 0, snippet);
+        }
         if (!text || isLikelyThinkingOrHeartbeat(text)) continue;
 
-        const kind = String(obj.type || '').toLowerCase();
-        const normNew = normalizeForEchoCheck(text);
-        const normStreamed = normalizeForEchoCheck(streamedText);
-        const isContentKind = kind === 'assistant' || kind === 'result' || kind === 'message';
-        const isRedundant =
-          streamedText &&
-          isContentKind &&
-          (
-            normNew === normStreamed ||
-            (normNew.length >= 20 && normStreamed.endsWith(normNew)) ||
-            normStreamed.startsWith(normNew) ||
-            (normNew.length >= 10 && normStreamed.includes(normNew)) ||
-            (normStreamed.length > normNew.length && normStreamed.includes(normNew))
-          );
-        if (isRedundant) continue;
-
-        const data = parseNdjsonLine(line.trim(), meta);
-        if (!data) continue;
-        this.push(`data: ${data}\n\n`);
-        if (kind === 'assistant') streamedText += text;
-        else if (kind === 'result' && !streamedText) streamedText = text;
-        else if (kind === 'message') streamedText = streamedText ? streamedText + text : text;
+        if (kind === 'result') {
+          clearWaitingTimer();
+          this.push(`data: ${buildChunkWithContent(meta, text)}\n\n`);
+          pushedAnyContent = true;
+          continue;
+        }
+        if (SHOW_THINKING && isThinking) {
+          clearWaitingTimer();
+          const display = THINKING_PREFIX ? THINKING_PREFIX + text : text;
+          this.push(`data: ${buildChunkWithContent(meta, display)}\n\n`);
+          pushedAnyContent = true;
+        }
       }
       callback();
     },
     flush(callback) {
+      clearWaitingTimer();
       if (buffer.trim()) {
+        sawNonEmptyLine = true;
         let obj;
         try {
           obj = JSON.parse(buffer.trim());
         } catch (_) {
+          sawParseError = true;
           obj = null;
         }
         if (obj) {
+          const kind = String(obj.type || '').toLowerCase();
           const text = extractTextFromStreamLine(obj);
+          const isThinking = kind === 'thinking' || kind === 'reasoning' || kind === 'thought';
+          if (STREAM_DEBUG && (kind === 'assistant' || kind === 'result' || kind === 'message' || isThinking))
+            console.log('[stream-raw] flush type=%s textLen=%d', kind, text?.length ?? 0);
           if (text && !isLikelyThinkingOrHeartbeat(text)) {
-            const kind = String(obj.type || '').toLowerCase();
-            const normNew = normalizeForEchoCheck(text);
-            const normStreamed = normalizeForEchoCheck(streamedText);
-            const isContentKind = kind === 'assistant' || kind === 'result' || kind === 'message';
-            const isRedundant =
-              streamedText &&
-              isContentKind &&
-              (
-                normNew === normStreamed ||
-                (normNew.length >= 20 && normStreamed.endsWith(normNew)) ||
-                normStreamed.startsWith(normNew) ||
-                (normNew.length >= 10 && normStreamed.includes(normNew)) ||
-                (normStreamed.length > normNew.length && normStreamed.includes(normNew))
-              );
-            if (!isRedundant) {
-              const data = parseNdjsonLine(buffer.trim(), meta);
-              if (data) {
-                this.push(`data: ${data}\n\n`);
-                if (kind === 'assistant') streamedText += text;
-                else if (kind === 'result' && !streamedText) streamedText = text;
-                else if (kind === 'message') streamedText = streamedText ? streamedText + text : text;
-              }
+            if (kind === 'result') {
+              this.push(`data: ${buildChunkWithContent(meta, text)}\n\n`);
+              pushedAnyContent = true;
+            } else if (SHOW_THINKING && isThinking) {
+              const display = THINKING_PREFIX ? THINKING_PREFIX + text : text;
+              this.push(`data: ${buildChunkWithContent(meta, display)}\n\n`);
+              pushedAnyContent = true;
             }
           }
         }
+      }
+      if (!pushedAnyContent && sawNonEmptyLine) {
+        const fallback = sawParseError ? FALLBACK_PARSE_ERROR : FALLBACK_NO_CONTENT;
+        this.push(`data: ${buildChunkWithContent(meta, fallback)}\n\n`);
       }
       callback();
     },
