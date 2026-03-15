@@ -3,6 +3,7 @@
 OpenClaw ↔ Cursor CLI 桥接服务：让钉钉等 IM 的请求走 Cursor 订阅，省钱且稳。
 
 - **设计文档**：[DESIGN.md](./DESIGN.md)
+- **Phase 3 Memory 实现规格与拆解**（代码设计、调用链、任务清单）：[DESIGN_PHASE3_IMPLEMENTATION.md](./DESIGN_PHASE3_IMPLEMENTATION.md)
 - **代码梳理**（模块职责、数据流、测试覆盖）：[CODE_OVERVIEW.md](./CODE_OVERVIEW.md)
 - **知识说明与排查**（API 区别科普、图示信息、无回复排查）：[NOTES.md](./NOTES.md)
 
@@ -143,6 +144,21 @@ pm2 startup   # 按提示执行以开机自启
 部署后用 `npm run pm2:smoke` 校验；日常可 `pm2 logs cursor-bridge`、`pm2 restart cursor-bridge`。
 
 **遇到问题**：`cursor-agent` 找不到（ENOENT）时可在 `.env` 里把 `CURSOR_AGENT_BIN` 设为绝对路径；pm2 下超时或重启频繁可看 [NOTES.md](./NOTES.md) 的排查说明。
+
+### 8. Phase 3 Memory（记忆注入与写回）— 默认不支持，开发中
+
+**当前默认**：桥**不提供** Memory 功能（不注入、不写回、不按 agent_id 分发 workspace）。推荐在 **Cursor 侧**用 Engram MCP 等方案做记忆，桌面端与 OpenClaw 行为一致。本节能力**仍在开发/试验**，如需试用再开启。
+
+若你仍希望由桥做「读 MEMORY/daily 注入 + 写回 daily」：
+
+- **总开关**：`CURSOR_BRIDGE_MEMORY_ENABLED=1`。未设或 0 时整个 Memory 逻辑不运行，无额外开销。
+- 写回：`CURSOR_BRIDGE_UPDATE_DAILY=1`
+- Agent 映射：`CURSOR_BRIDGE_AGENT_WORKSPACES=00_小哩中枢:7-Agents/00_小哩中枢`（多组用逗号分隔）
+- 其他见 `.env.example` 中 Phase 3 注释
+
+记忆分层：**近**（根 MEMORY + 今日/昨日 daily + 当前 Agent MEMORY）查得快；**远** / **他 Agent** 仍能查全。默认不设字符限额。
+
+实现细节见 [DESIGN_PHASE3_IMPLEMENTATION.md](./DESIGN_PHASE3_IMPLEMENTATION.md)；工作流示例见 [docs/MEMORY_WORKFLOW_EXAMPLE.md](./docs/MEMORY_WORKFLOW_EXAMPLE.md)。
 
 ---
 

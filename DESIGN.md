@@ -82,6 +82,34 @@ OpenClaw ──HTTP──▶ cursor-bridge ──spawn──▶ cursor-agent ─
 | **钉钉 OpenClaw** | 钉钉 → OpenClaw GW → **cursor-bridge** → cursor-agent → Cursor 云端 | **走桥** |
 | **OpenClaw fallback** | 钉钉 → OpenClaw GW → OpenRouter/Google API | 桥不可用时自动降级 |
 
+### 2.4 多后端兼容：Cursor CLI 与 Gemini CLI（设计讨论）
+
+**同一类逻辑**：调用 Cursor CLI 和调用 Gemini CLI 在抽象层面是同一类逻辑——**spawn 子进程 → 传入输入（prompt + 参数）→ 读 stdout（流或缓冲）→ 转成 OpenAI 兼容的 HTTP 响应**。桥当前只对接 cursor-agent，但若把「谁被 spawn、传什么参数、怎么解析 stdout」抽成可插拔的后端，理论上可以在同一套桥里做**兼容与切换**。
+
+**可抽象出的统一形态**：
+
+| 层次 | 统一接口 | Cursor 实现 | Gemini 实现（假设） |
+|------|----------|-------------|----------------------|
+| **入口** | HTTP POST /v1/chat/completions（不变） | 同左 | 同左 |
+| **Runner** | `runAgent(opts)` / `runAgentStream(opts)`，返回 content 或 stream | 当前 agent-runner：spawn cursor-agent，args 含 `--print`、`--output-format stream-json`、`--workspace` 等 | spawn gemini CLI，args 含 prompt 位置、`--model`、`--output-format` 等（以 Gemini CLI 实际能力为准） |
+| **输出解析** | 将 stdout 转为「同一套」SSE 或 JSON 体 | stream-parser：NDJSON（type: assistant/result/message）→ OpenAI SSE | 需适配：Gemini CLI 可能是纯文本或另一种 JSON/流格式，需单独 parser 或 adapter 转成同一 SSE 形状 |
+| **配置切换** | 通过环境变量或配置选择后端 | `AGENT_BACKEND=cursor`（或默认），`CURSOR_AGENT_BIN`、`CURSOR_WORKSPACE` 等 | `AGENT_BACKEND=gemini`，`GEMINI_CLI_BIN`、`GEMINI_MODEL` 等 |
+
+**实现上需要做的**（讨论用，非承诺实现）：
+
+1. **Runner 抽象**：定义 `createRunner(backend)` 或按 `AGENT_BACKEND` 返回不同 runner；每个 runner 暴露 `runAgent` / `runAgentStream`，入参可统一（如 `{ prompt, workspace?, model?, timeoutMs }`），内部各自 spawn 对应 CLI、传各自参数。
+2. **解析层**：Cursor 继续用现有 stream-parser（NDJSON → SSE）；Gemini 需新增一层「Gemini stdout → 与现有 SSE 同构」的转换（若 Gemini 只出纯文本，可封装成「单块 content」的 SSE）。
+3. **配置**：如 `AGENT_BACKEND=cursor|gemini`，以及各后端自己的 `*_BIN`、`*_WORKSPACE`/`*_MODEL` 等，避免冲突。
+4. **健康检查**：`GET /health` 需根据当前 backend 调对应 CLI（如 `cursor-agent about` vs `gemini --version` 或等价）判断可用性。
+
+**注意点**：
+
+- **workspace**：cursor-agent 强依赖 `--workspace`（当前桥的 CURSOR_WORKSPACE）；Gemini CLI 是否支持「工作区」或等价概念需查文档，若没有则传空或忽略。
+- **流式**：Cursor 有 `--output-format stream-json`；Gemini CLI 是否支持流式、格式如何，决定是「全量读再转 SSE」还是「边读边转」。
+- **成本与目标**：多后端会增加维护和测试量；若目标是「同一 OpenClaw 入口可切 Cursor 或 Gemini」，在桥里做统一抽象是合理方向；若只是「偶尔用 Gemini」，也可以由 OpenClaw 直接配多条模型通道（如主 Cursor 桥、备选 OpenRouter/Gemini API），不必一定在桥内切 CLI。
+
+本节为设计讨论，具体是否实现、以何优先级实现，可按需求再定。
+
 ---
 
 ## 3. 接口设计（协议契约）
@@ -493,6 +521,9 @@ cursor-agent 在该 workspace 下可以：
 | **V2** | 桥自动注入 Memory 上下文到 system prompt | prompt-builder 读取 MEMORY.md + 当日 daily note，拼入 system 消息 |
 | **V3** | 按 Agent 分发到不同 workspace / 不同 memory | 桥根据 OpenClaw 传来的 agent_id，选择对应的 agentDir 和 memory 文件 |
 | **V4** | cursor-agent 执行后自动更新 memory | 桥在请求结束后，触发一次 cursor-agent 做 memory 归档 |
+| **Phase 4：多模态** | 钉钉/渠道上传的图片等经桥传给 Cursor | 桥识别 `image_url`、落盘并在 prompt 中写入路径；cursor-agent 通过读文件看图（见 10.5） |
+| **Phase 5：厂内环境 + memory 复用** | 厂内与厂外共享上下文、厂内沉淀可合并回本地 | BOS 仅存 index/摘要（不做全量同步）；厂外推摘要到 BOS、厂内读 index 注入并写回摘要、厂外拉取合并（见 10.6） |
+| **Phase 6：体验优化** | 更快、更智能 | 模型选择、prompt 压缩、plan/ask 只读、并发管理（见 §11） |
 
 ### 10.3 与 OpenClaw 多 Agent 体系的对接
 
@@ -506,6 +537,17 @@ cursor-agent 在该 workspace 下可以：
 ### 10.4 Phase 3 Memory 体系运作设计（讨论稿）
 
 目标：让经桥调用的 cursor-agent **有记忆**——既能读到「记忆」上下文，又能在合适时机把本次对话沉淀回记忆。下面按三条 Phase 3 任务拆成「谁读谁写、何时、怎么接 OpenClaw」。
+
+#### 10.4.0 需求与优先级（产品锚点）
+
+- **需求一**：**节省 token 输入**。少发重复或冗长上下文，用记忆/索引替代「最近 N 条」完整历史。
+- **需求二**：**最大化获取第二大脑的信息**。AI 能充分读取**笔记与代码**（如 `Code_Library` 下的 Python、C++ 等）中的知识、任务、记忆，不遗漏可用的沉淀内容。
+- **需求三**：**Cursor 与 OpenClaw（经桥）的对话与记忆，都存到同一套笔记里**。公用、持久化，知识/任务管理等有一处统一的存储，两路调用共享同一套第二大脑；代码改动仍落在对应代码库目录。
+
+- **使用形态**：**笔记**改写较多（daily、MEMORY、项目笔记等经常更新）；**代码**以读为主、少部分改写（查实现与上下文为主，按需求改某段代码为少数）。
+- **最高优先级**：**第二大脑（笔记 + 代码） = 完全沉淀 + 方便读取**。  
+  一切设计以「笔记库与代码库是唯一的事实来源、该沉淀的落库、且人类与 AI 都能方便读取」为第一原则。即：**先保证写进去、读得着；再在之上做索引、省 token、多路写入**。  
+  若与「省 token」或「实现复杂度」冲突，优先保证沉淀完整与可读性。
 
 #### 10.4.1 记忆在笔记库里的形态（约定）
 
@@ -529,7 +571,7 @@ workspace 根 = 当前桥的 `CURSOR_WORKSPACE`（笔记库根）。若 Phase 3 
   - 若按 Agent 分发：还可读 `7-Agents/<id>/MEMORY.md`
 - **注入方式**：把上述内容拼成一段文本（例如 `[Memory]\n...`），**预拼到 system 消息前面**，或作为第一条 system 的 content 前缀，再交给现有 `buildPrompt(messages)`。这样 cursor-agent 看到的 prompt 里已经带记忆，无需它自己先读文件（减少工具调用、延迟更可控）。
 - **边界与开放点**：
-  - **长度与裁剪**：MEMORY.md + daily 可能很长，需策略（按字符/按段/按条数裁剪、或只取「最近 N 条」）。否则容易爆上下文、拖慢首 token。
+  - **长度与裁剪**：MEMORY.md + daily 可能很长，需策略（按字符/按段裁剪，或只取摘要段）。否则容易爆上下文、拖慢首 token。产品决策：有 Memory 注入时，**对话历史可极简为「当前一条 user」**，其余上下文靠 Memory 承载（见 10.4.6）。
   - **是否可配置**：例如环境变量 `CURSOR_BRIDGE_INJECT_MEMORY=1`、`CURSOR_BRIDGE_INJECT_DAILY=1`，或按 agent_id 配置「只注入根 MEMORY」「根 + daily」「根 + daily + Agent MEMORY」等。
 
 #### 10.4.3 任务二：按 Agent 分发不同 workspace
@@ -572,14 +614,172 @@ runAgent / runAgentStream(--workspace <该 Agent 的 workspace>)
 （可选）请求结束后：桥写 daily 或再调 cursor-agent 做 memory 归档
 ```
 
-#### 10.4.6 开放问题（待定）
+#### 10.4.6 决策结论（产品侧拍板）
 
-- **OpenClaw 是否已支持在请求里带 agent_id**：若尚未支持，需 OpenClaw 侧先扩展（header 或 body），桥再按约定解析；或短期用「单 workspace + 只注入根 MEMORY/daily」不区分 Agent。
-- **注入记忆的 token 上限与裁剪策略**：例如「MEMORY.md 最多取前 4k 字 + 今日 daily 前 2k 字」，避免首 token 过慢。
-- **daily 更新内容格式**：与现有 `memory/YYYY-MM-DD.md` 的用法（如 AI 交互记录、复盘）是否统一，是否需要和 AGENTS.md 里「Write It Down」的格式对齐。
-- **Agent 级 MEMORY.md 的维护**：若每个 Agent 有独立 MEMORY，是仅「注入读取」还是也支持「请求结束后写回该 Agent 的 MEMORY」；若写回，是否一律走 cursor-agent 归档（避免桥解析语义）。
+- **① Agent ID**：支持传 agent_id。信息多时用 agent_id 做区分；OpenClaw 在请求头或 body 中传递，桥解析后用于 workspace 分发与 memory 选择。
+- **② 注入长度与「最近 N 条」**：有 Memory 注入后，**不再依赖「最近 N 条」对话历史**——上下文由 Memory 承载，请求里只需**当前一条 user** 即可。即：开启 Memory 注入时，可默认或配置为「单轮」（一条 system + 一条当前 user），其余信息全在 MEMORY.md / daily 里；这样既省 token，又避免重复。若 OpenClaw 仍传多轮，桥可配置为「仅取最后一条 user」或保留 1 条 system + 1 条 user。
+- **③ 写回格式**：尽量统一；格式可参考**社区最佳实践**（如 daily note、AI 交互记录的常见模板），并与现有 `memory/YYYY-MM-DD.md`、AGENTS.md「Write It Down」用法对齐。实现前可做一次社区写法调研，再定桥侧写回模板。
+- **④ Agent memory 与公用 memory、索引模型**：见下节 10.4.7。
 
-以上可作为 Phase 3 实现前与产品/OpenClaw 对齐的讨论基础；定稿后再反哺到 11 节 Phase 3 的拆项与验收标准。
+#### 10.4.7 Memory 作为索引层（与 Agent / 公用统一）
+
+目标：**Agent 记忆与公用记忆尽量统一**；**Cursor 每次对话、笔记本里的内容，都方便记入同一套 memory**；**能从 memory 里快速索引、取出信息**。采用「Memory 存索引、笔记本存正文」的分层方式。
+
+- **分层约定**
+  - **笔记本 + 代码库（大量正文与实现）**：日常笔记、项目文档、对话记录等放在笔记库的 .md 中；Python、C++ 等代码放在如 `3-Resources资料参考/Code_Library代码库` 等目录。**笔记**改写较多；**代码**以读为主、少部分改写。
+  - **Memory（索引与摘要）**：MEMORY.md（及按 Agent 的 MEMORY）里存的主要是**索引、摘要、关键结论、指针**（例如「某主题见 `path/to/note.md`」「某实现见 `Code_Library/xxx`」「某决策：…」），而不是大段原文。AI 需要时先看 Memory，再按索引打开对应笔记或代码文件读取详情。
+- **统一写入与来源**
+  - **Cursor 桌面 / Cursor Mobile 的对话**：其产生的记忆应能写入同一套 memory 体系（例如通过 Cursor 侧或桥侧约定：会话结束后更新 MEMORY.md / daily，以索引或摘要形式）。
+  - **桥（OpenClaw 钉钉）的对话**：请求结束后写回 daily / MEMORY，格式与上统一，便于和 Cursor 的对话记忆合流。
+  - **笔记本内手写/整理的内容**：也可通过约定路径或模板（如 daily、项目下的 README）被视作 memory 的一部分；Memory 层只存指向这些内容的索引或一句摘要。
+- **统一读取与检索**
+  - 桥注入 Memory 时，把「根 MEMORY + 今日 daily + 可选 Agent MEMORY」注入 prompt；cursor-agent 在 workspace 下也能直接读任意笔记文件。即：**AI 先用 Memory 里的索引知道「有什么、在哪」，再按需读具体笔记**。后续若做检索（如按关键词找 note），可在 Memory 文本或独立索引结构中实现，目标都是「从 memory 快速索引、拿到信息」。
+- **与 Agent 的共用**
+  - Agent 级 MEMORY（如 `7-Agents/00_小哩中枢/MEMORY.md`）与公用 MEMORY（根目录 `MEMORY.md`）在**格式与用法上尽量一致**：都以索引/摘要为主，正文在笔记里。不同 Agent 可共享根 MEMORY 的只读注入，同时拥有自己目录下的 MEMORY 用于该 Agent 的专属记忆；写回时可按 agent_id 决定写根 daily、根 MEMORY，还是 Agent 目录下的 MEMORY，实现「尽可能和 Agent 及公用」统一。
+
+以上结论已纳入 Phase 3 设计；实现时按 10.4.1～10.4.5 的流程，并遵循 10.4.6、10.4.7 的决策与索引模型。
+
+#### 10.4.8 实现归属：放在 cursor-bridge 还是单独代码仓
+
+| 维度 | 放在 cursor-bridge | 单独代码仓（如 memory-service） |
+|------|--------------------|----------------------------------|
+| **职责** | 桥 = 协议翻译 + 记忆注入 + 写回，一个进程完成 | 桥只做协议翻译；记忆获取/写回由独立服务做，职责更清晰 |
+| **部署** | 只跑一个 bridge，用户心智简单 | 需跑 bridge + memory 服务，多一个进程与配置 |
+| **调用链** | 请求 → 桥（读 MEMORY/调 Engram/拼 prompt）→ cursor-agent；写回在桥内完成 | 请求 → 桥 → 调 memory 服务取上下文 → 拼 prompt → cursor-agent；写回时桥再调 memory 服务，多一跳 |
+| **复用** | 记忆逻辑与桥强绑定，若 Cursor 桌面等要复用需再抽 | 记忆服务可被 bridge、其他工具共用，独立迭代 |
+| **复杂度** | 桥代码库略变重，但 Phase 3 增量可控（读文件/可选调 API、写回模板） | 多一个仓库与运维，适合「记忆服务很重、多调用方」时 |
+
+**推荐**：**Phase 3 优先放在 cursor-bridge 内实现**。  
+- 请求必经桥，注入与写回和请求生命周期强绑定，放在桥里最直接，无需多一层网络或进程。  
+- 当前阶段「读 MEMORY/daily 注入 + 请求结束写回」体量不大，单独起仓收益有限，反而增加部署与排障成本。  
+- 若后续记忆逻辑变重、或 Cursor 桌面/其他工具也要复用同一套「记忆上下文服务」，再把记忆相关代码抽成独立仓库或服务不迟。
+
+**与 Engram MCP 的关系**：若采用「cursor-agent 配置 Engram MCP、由 agent 内部调 MCP 取记忆」，则桥侧可只做「读文件注入」或不做注入，桥无需直接调 Engram。若采用「桥在拼 prompt 前调 Engram 的 HTTP/API 拿到记忆再注入」，则该调用逻辑放在 bridge 仓内即可，仍推荐单仓。
+
+### 10.5 多模态（图片等）桥支持
+
+**完整设计文档**（目标、数据流、协议、实现要点、任务清单）：[docs/DESIGN_PHASE4_MULTIMODAL.md](docs/DESIGN_PHASE4_MULTIMODAL.md)。
+
+**目标**：钉钉等渠道上传的图片（或其它媒体）能经桥传导给 cursor-agent，使 Cursor 能「看图说话」。
+
+**当前限制**：桥的 prompt-builder 只从 `messages[].content` 抽取纯文本，不处理 `image_url` 或图片 part，钉钉发来的图片在桥侧被忽略。cursor-agent CLI 根据 [Headless 文档](https://cursor.com/docs/cli/headless) **不接收内联 base64/URL**，而是通过 **「在 prompt 里写文件路径」** 传图，agent 用读文件工具打开。
+
+**设计要点**：
+
+| 环节 | 职责 |
+|------|------|
+| **OpenClaw** | 钉钉上传图片后，在请求里带多模态 content：如 `content: [{ type: "text", text: "…" }, { type: "image_url", image_url: { url: "data:image/...;base64,..." } }]`；或先落盘后在消息里注明路径（如 `[图片: /tmp/xxx.png]`），由桥原样拼进 prompt。 |
+| **桥** | (1) 识别 `content` 中的 `image_url`（含 data URL）：解码 base64 → 在 workspace 或约定临时目录写入文件（如 `memory/.uploads/<requestId>.<ext>`）；(2) 在拼出的 prompt 中插入「用户发送了一张图片，路径为：<绝对路径>。请根据图片内容回答。」并把用户文字一起拼进去；(3) 若消息中已是路径占位文字，直接保留在 prompt 中。 |
+| **cursor-agent** | 无需改；prompt 中带文件路径后，agent 通过读文件工具看图并回答。 |
+
+**实现范围（桥侧）**：
+
+- 扩展 `prompt-builder`（或前置步骤）：遍历每条 message 的 content；遇 `type: "image_url"` 且 `image_url.url` 为 data URL 时，解码并落盘，得到本地路径，再将该条替换为/追加为「图片路径说明」文本参与拼 prompt。
+- 落盘目录：建议在 `CURSOR_WORKSPACE` 下约定子目录（如 `memory/.uploads/` 或 `.bridge-uploads/`），按请求 id 或时间戳命名，避免冲突；可选请求结束或定时清理旧文件。
+- 配置：可选 `CURSOR_BRIDGE_MULTIMODAL_IMAGES=1` 开启图片落盘与路径注入；关闭时保持当前行为（仅文本）。
+
+**依赖**：OpenClaw 需在调用桥时把渠道图片以 `image_url` 或路径占位形式放入 messages；若 OpenClaw 当前未传图，需先在其侧支持再在桥侧对接。
+
+详细现象与方案参见 NOTES.md §5.6。
+
+### 10.6 厂内环境与 memory 复用（Phase 5）
+
+**背景**：厂内机器无操作权限，无法在机器上做工程实验或直接跑 cursor-bridge；需要用厂内 comet 或厂内部署的 OpenClaw。希望**无论厂内用哪种工具、厂外用 cursor-bridge，都能复用同一套第二大脑**，所有内容沉淀到公用 memory。
+
+**目标**：厂内（comet / 厂内 OpenClaw）与厂外（cursor-bridge + Cursor）通过 **BOS 上的 index/摘要** 共享上下文轮廓；厂内会话沉淀以摘要写回 BOS，厂外合并进本地第二大脑，实现「跨环境记忆衔接」而不做全量同步、不把私有正文上云。
+
+**约束**：
+
+- 厂内不能直接装桥或动机器；**厂内不可访问厂外，数据也不能出厂**（方式 A 不可行）。
+- 厂内存储可走 BOS，BOS 可从外网访问，故 BOS 可作为**中转**；但**笔记本体量大，全量实时同步不现实**，且**私有数据不宜整库放 BOS**，只适合在 BOS 上存 **index/摘要** 级别的内容。
+
+**两层问题**：
+
+- **存到哪里**：BOS 只做**轻量中转**——存 index/摘要，不存完整第二大脑全文；厂外完整数据留在本地，厂内只读 BOS 上的 index、写回摘要。
+- **谁、怎样用这份 memory**：厂外桥在本地做完整「读→注入、写回」；厂内从 BOS 读 index 注入、会话结束写回摘要到 BOS；厂外可定期拉取厂内写回条目并合并进本地 memory。
+
+#### 10.6.1 厂内如何用上 memory：三种方式（当前仅 B/C 可行）
+
+| 方式 | 做法 | 适用性 |
+|------|------|--------|
+| **A. 厂内直接接入厂外 cursor-bridge** | 厂内请求打厂外桥，桥调 Cursor；memory 在桥侧。 | **不可行**：厂内不可访问厂外、数据不能出厂。 |
+| **B. 协议 + BOS index，厂内工具自实现** | BOS 只存 **index/摘要**（见 10.6.2）；厂内工具读 BOS 上的 index → 注入 prompt，会话结束把**摘要**写回 BOS；厂外定期把厂内写回合并进本地。 | 可行；厂内实现「读 BOS index、注入、写回摘要」。 |
+| **C. 厂内轻量 memory 适配服务** | 厂内小服务：读 BOS index、按协议注入与写回摘要；厂内 comet/OpenClaw 调该服务。 | 可行；协议集中在一处，多工具复用。 |
+
+**结论**：在「数据不出厂、不访问厂外」前提下，仅 **B 或 C**；BOS 上只放 **index/摘要**，不做全量同步，私有正文留在本地。
+
+#### 10.6.2 BOS 只存 index/摘要（不做全量同步）
+
+**原则**：完整第二大脑（MEMORY.md、daily、笔记库）留在**厂外本地**；BOS 仅作为**厂内/厂外共享的轻量层**，存可对外暴露的 index/摘要，体量小、可定期更新。
+
+| 环节 | 职责 |
+|------|------|
+| **厂外 → BOS（推送）** | 桥或本地脚本**定期/按需**生成并上传：例如「MEMORY 摘要」（关键事实、决策、偏好，脱敏）、「近期要点」（如近 N 日 daily 的摘要或标题列表）。不推送全文；格式可为约定好的 JSON/MD，体积可控。 |
+| **BOS 上内容** | 仅 index/摘要：如 `memory_index.json`（MEMORY 摘要）、`recent_highlights.md`（近期要点）、可选 `structure_index.md`（笔记/项目目录结构索引，不含正文）。厂内会话写回也以「摘要条目」形式 append（如「日期 + 主题 + 结论」），不存完整对话。 |
+| **厂内** | 从 BOS 拉取上述 index；在请求前把 index 内容注入到 prompt，使厂内 agent 具备「上下文轮廓」。会话结束后，把**本次会话摘要**（时间、主题、关键结论）写回 BOS 的写回区；不写完整对话内容。 |
+| **厂外 ← BOS（拉取合并）** | 厂外定期（或手动）拉取 BOS 上「厂内写回」的摘要条目，合并进本地 `memory/YYYY-MM-DD.md` 或 MEMORY.md（如「厂内 session：…」），保证第二大脑里也有厂内产生的沉淀。 |
+
+**隐私与体量**：私有正文不落 BOS；BOS 仅存可接受对外/上云的 index 与摘要，且数据量小，无需实时全量拷贝。
+
+#### 10.6.3 协议（index 格式与写回约定）
+
+- **Index 格式**：约定 BOS 上文件名与结构（如 `memory_index.json`、`recent_highlights.md`、`inbound/` 厂内写回目录）；与 10.4.1 的「记忆形态」在**语义上对齐**（摘要对应 MEMORY/daily 的提炼），但**不要求**与本地文件路径一致（因 BOS 不是全量镜像）。
+- **厂内写回格式**：约定单条摘要的字段（日期、来源、主题、结论/要点），便于厂外脚本解析并合并到本地 daily/MEMORY。
+- **文档化**：将「BOS index 结构 + 厂内读/写回协议」整理成独立说明，便于厂内按 B 或 C 实现、厂外实现推送/拉取合并脚本。
+
+#### 10.6.4 独立同步工具：MCP + BOS 中转 + 本机轮询 server（推荐形态）
+
+**思路**：做一个**独立工具**，通过 BOS 中转 + 本机轮询，同时满足「厂内沉淀进第二大脑」和「厂内查第二大脑」两条需求；两条需求**统一放在同一个 MCP** 里，厂内一个入口，本机一个 server 处理两类 BOS 目录。
+
+**需求一：厂内做的事 / 知识沉淀 → 进第二大脑**
+
+- 厂内工具（comet 等）调用 MCP 的 **「存到第二大脑」** 工具（如 `save_to_second_brain(content, metadata?)`）。
+- MCP 侧：把内容按约定格式写入 BOS 的**写回区**（如 `inbound/save/`），可选带元数据（日期、来源、类型）。
+- 本机侧：**轮询 server** 定期拉取 BOS 写回区，发现新条目就解析并**合并进本地 iCloud 第二大脑**（如 append 到 `memory/YYYY-MM-DD.md` 或写入 MEMORY，按约定规则）。
+- 效果：厂内产生的信息/知识自动经 BOS 进入你的专属第二大脑，无需厂内直接访问本机。
+
+**需求二：厂内查第二大脑（带 Cursor 的「真」查询）**
+
+- 厂内工具调用 MCP 的 **「查第二大脑」** 工具（如 `query_second_brain(prompt)`）。
+- MCP 侧：把 `prompt` 及约定格式（如 request_id、时间戳）写入 BOS 的**查询请求区**（如 `inbound/query/`）。
+- 本机侧：轮询 server 发现新请求 → 把该 prompt **带入本机 Cursor 进程**（如经 cursor-bridge 或 cursor-agent）执行 → 得到返回后写入 BOS 的**响应区**（如 `outbound/query/<request_id>`）。
+- 厂内侧：MCP 轮询或一次性读 BOS 响应区，拿到结果后返回给厂内调用方。
+- 效果：厂内「问第二大脑」时，实际是本机 Cursor 在完整第二大脑上执行，答案经 BOS 回传厂内；数据不出厂（只有 prompt 与结果经 BOS 中转，且可由你控制脱敏与体积）。
+
+**是否把需求一和需求二都放进同一个 MCP？**
+
+- **推荐：统一进同一个 MCP**。  
+  - 厂内只需对接一个 MCP，暴露两个能力：`query_second_brain`（查）、`save_to_second_brain`（存）。心智简单、一次配置。  
+  - 本机侧同一个 **轮询 server** 即可：既轮询「查询请求区」并调 Cursor、写回响应区，又轮询「写回区」并合并到本地第二大脑。实现可复用 BOS 客户端、鉴权与目录约定。  
+  - 「存」和「查」语义对称，都表达「和第二大脑交互」，放在一个工具里更一致。
+- **若需求一单独做**：厂内不用 MCP 存，而是直接往 BOS 某目录写（或调别的 API），本机只做 BOS→本地合并。这样 MCP 只负责「查」。缺点是多一套对接方式；适合「存」的触发方非常分散、且形态简单（仅写文件）时再考虑。
+
+**BOS 目录建议（与 10.6.2 / 10.6.3 对齐）**
+
+| BOS 路径 | 方向 | 用途 |
+|----------|------|------|
+| `index/memory_index.json`、`index/recent_highlights.md` 等 | 厂外 → BOS | 本机推送的 index/摘要，厂内 MCP 或工具可读后注入 prompt |
+| `inbound/query/<id>.json` | 厂内 → BOS | 厂内「查第二大脑」请求（prompt + 元数据）；本机轮询处理 |
+| `outbound/query/<id>.json` | BOS → 厂内 | 本机 Cursor 执行结果；厂内 MCP 读后返回调用方 |
+| `inbound/save/<id>.json` 或按日分文件 | 厂内 → BOS | 厂内「存到第二大脑」内容；本机轮询合并到本地 |
+
+**实施要点**：见 Phase 5 checklist（§11）；独立工具可拆为「厂内 MCP 实现」+「本机轮询 server（含 Cursor 调用与写回合并）」两部分的实现与部署说明。
+
+#### 10.6.5 厂内工具选型：Comate vs OpenClaw（厂内）
+
+**核心**：厂内只要有一种工具**能接上述 MCP**（查第二大脑、存到第二大脑），即可满足「和第二大脑互相同步」的需求；不必同时上 Comate 和 OpenClaw，按场景选一个或两个即可。
+
+| 工具 | 典型场景 | 与 MCP 的关系 | 是否「必须」 |
+|------|----------|----------------|--------------|
+| **Comate**（AI IDE） | 厂内编码、问问题、读代码；调 MCP 查第二大脑、存沉淀。 | 若 Comate 支持配置 MCP，接上即可实现查/存。 | **不必**和 OpenClaw 二选一；若你主要需求是「厂内 IDE 里用第二大脑」，Comate 单用就够。 |
+| **OpenClaw（厂内）** | 在**聊天渠道**（如钉钉）里和 AI 对话、并可**在聊天里发起/运行实验**（提交任务、跑流水线等）。 | 厂内 OpenClaw 配置成调用同一套 MCP，即可在钉钉里也「查/存第二大脑」。 | 多出来的价值是「**在聊天里跑实验**」——若你需要这条，配厂内 OpenClaw 才有意义；若不需要，Comate + MCP 即可。 |
+
+**建议**：
+
+- **只想要「厂内也能查第二大脑、把厂内产出沉淀回去」**：用 **Comate + MCP** 即可，不必额外配厂内 OpenClaw；配置量小、心智简单。
+- **还想要「在钉钉/聊天里一句话触发厂内实验」**：再上 **厂内 OpenClaw**，并把同一 MCP 配进去；这样聊天里既能查/存第二大脑，又能跑实验。此时 OpenClaw 的「多 Agent + 聊天入口 + 可编排动作」才有明显加成。
+
+**结论**：Comate 和厂内 OpenClaw 不是非此即彼；**至少有一种厂内工具能接该 MCP** 就有意义。OpenClaw 厂内的额外意义在于「在聊天里跑实验」，按需决定是否配置。
 
 ---
 
@@ -614,7 +814,26 @@ runAgent / runAgentStream(--workspace <该 Agent 的 workspace>)
 - [ ] 按 Agent 分发不同 workspace
 - [ ] 请求结束后自动更新 daily note
 
-### Phase 4：体验优化
+### Phase 4：多模态（图片）桥支持
+
+**目标**：钉钉等渠道上传的图片经桥传给 Cursor，agent 能看图回答（见 10.5）
+
+- [ ] prompt-builder 扩展：识别 `content` 中的 `image_url`（data URL），解码 base64 并落盘到 workspace 约定目录
+- [ ] 在拼出的 prompt 中插入图片路径说明（「用户发送了一张图片，路径为：…」）
+- [ ] 可选配置 `CURSOR_BRIDGE_MULTIMODAL_IMAGES=1` 与落盘目录、清理策略
+- [ ] 与 OpenClaw 侧约定：请求中带图片时以 `image_url` 或路径占位形式放入 messages
+
+### Phase 5：厂内环境与 memory 复用
+
+**目标**：厂内（无机器操作权限、不可访问厂外、数据不出厂）也能用 AI；厂内**沉淀**进第二大脑、厂内**查**第二大脑，通过「独立同步工具：MCP + BOS 中转 + 本机轮询 server」统一实现（见 10.6，含 10.6.4）
+
+- [ ] **BOS 仅存 index/摘要 + 中转文件**：约定 BOS 目录（index 区、`inbound/query`、`outbound/query`、`inbound/save`）；不存全量笔记库，私有正文留本地
+- [ ] **厂内 MCP（统一入口）**：提供 `query_second_brain(prompt)`（写 BOS 请求区、读响应区返回）与 `save_to_second_brain(content, metadata?)`（写 BOS 写回区）；厂内 comet 等接此 MCP 即可「查」+「存」
+- [ ] **本机轮询 server**：常驻进程轮询 BOS——(1) 发现新查询请求则调本机 Cursor（或 cursor-bridge）执行，结果写 BOS 响应区；(2) 发现新写回则合并进本地 iCloud 第二大脑（memory/daily 或 MEMORY）
+- [ ] **厂外 → BOS（index）**：定期/按需生成 MEMORY 摘要与近期要点上传 BOS index 区，供厂内注入上下文（可选，与 MCP 读 index 对齐）
+- [ ] **协议与部署文档化**：BOS 路径与报文格式、本机 server 与 Cursor 的调用方式、合并规则；独立工具可拆为「厂内 MCP」+「本机 server」两部分的实现说明
+
+### Phase 6：体验优化
 
 **目标**：更快、更智能
 

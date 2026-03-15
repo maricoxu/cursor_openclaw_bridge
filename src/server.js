@@ -19,6 +19,9 @@ function pathname(req) {
 import { buildPrompt } from './prompt-builder.js';
 import { runAgent, runAgentStream, resolveExecutable } from './agent-runner.js';
 import { createStreamParser } from './stream-parser.js';
+import { resolveWorkspace } from './memory-resolver.js';
+import { readMemoryContext } from './memory-reader.js';
+import { appendDailyNote } from './daily-writer.js';
 
 import dotenv from 'dotenv';
 if (process.env.NODE_ENV !== 'test') {
@@ -42,6 +45,21 @@ const CURSOR_DEBUG_PROMPT = /^(1|true|yes)$/i.test(process.env.CURSOR_DEBUG_PROM
 const CURSOR_FORCE_NON_STREAM = /^(1|true|yes)$/i.test(process.env.CURSOR_FORCE_NON_STREAM || '');
 /** 为 1/true 时：打印请求/响应及 runAgent 等调试日志；默认不打印，减少开销 */
 const BRIDGE_DEBUG = /^(1|true|yes)$/i.test(process.env.CURSOR_BRIDGE_DEBUG || '');
+
+/** Phase 3 Memory：总开关。未设或 0 时关闭整个 Memory 功能（注入、写回、agent workspace 分发） */
+const CURSOR_BRIDGE_MEMORY_ENABLED = /^(1|true|yes)$/i.test(process.env.CURSOR_BRIDGE_MEMORY_ENABLED || '');
+const CURSOR_BRIDGE_MEMORY_SINGLE_TURN = /^(1|true|yes)$/i.test(process.env.CURSOR_BRIDGE_MEMORY_SINGLE_TURN || '');
+const CURSOR_BRIDGE_UPDATE_DAILY = /^(1|true|yes)$/i.test(process.env.CURSOR_BRIDGE_UPDATE_DAILY || '');
+// 字符限额：默认 0 = 不限额；仅当显式配置为正数时才截断（便于后续分析或控 token 时再设）
+const CURSOR_BRIDGE_MEMORY_NEAR_MAX_ROOT = Math.max(0, parseInt(process.env.CURSOR_BRIDGE_MEMORY_NEAR_MAX_ROOT || '0', 10));
+const CURSOR_BRIDGE_MEMORY_NEAR_MAX_DAILY_TODAY = Math.max(0, parseInt(process.env.CURSOR_BRIDGE_MEMORY_NEAR_MAX_DAILY_TODAY || '0', 10));
+const CURSOR_BRIDGE_MEMORY_NEAR_MAX_DAILY_YESTERDAY = Math.max(0, parseInt(process.env.CURSOR_BRIDGE_MEMORY_NEAR_MAX_DAILY_YESTERDAY || '0', 10));
+const CURSOR_BRIDGE_MEMORY_NEAR_MAX_AGENT = Math.max(0, parseInt(process.env.CURSOR_BRIDGE_MEMORY_NEAR_MAX_AGENT || '0', 10));
+const CURSOR_BRIDGE_MEMORY_FAR_DAYS = Math.max(0, parseInt(process.env.CURSOR_BRIDGE_MEMORY_FAR_DAYS || '0', 10));
+const CURSOR_BRIDGE_MEMORY_FAR_MAX_PER_DAY = Math.max(0, parseInt(process.env.CURSOR_BRIDGE_MEMORY_FAR_MAX_PER_DAY || '0', 10));
+const CURSOR_BRIDGE_MEMORY_OTHER_AGENTS = /^(1|true|yes)$/i.test(process.env.CURSOR_BRIDGE_MEMORY_OTHER_AGENTS || '');
+const CURSOR_BRIDGE_MEMORY_OTHER_MAX_PER_AGENT = Math.max(0, parseInt(process.env.CURSOR_BRIDGE_MEMORY_OTHER_MAX_PER_AGENT || '0', 10));
+const CURSOR_BRIDGE_DAILY_WRITE_THROTTLE_MIN = Math.max(0, parseInt(process.env.CURSOR_BRIDGE_DAILY_WRITE_THROTTLE_MIN || '5', 10));
 
 const MODEL_ID = 'cursor-agent';
 const DEBUG_PROMPT_FILE = path.join(__dirname, '..', '.cursor-bridge-last-prompt.txt');
@@ -71,7 +89,52 @@ function getEffectiveConfig() {
     CURSOR_SINGLE_TURN,
     CURSOR_FORCE_NON_STREAM,
     CURSOR_BRIDGE_DEBUG: BRIDGE_DEBUG,
+    CURSOR_BRIDGE_MEMORY_ENABLED: CURSOR_BRIDGE_MEMORY_ENABLED,
+    CURSOR_BRIDGE_UPDATE_DAILY: CURSOR_BRIDGE_UPDATE_DAILY,
   };
+}
+
+/** 从 messages 中取最后一条 user 的 content 纯文本（供 daily 写回用） */
+function getLastUserContent(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if ((m?.role || '').toLowerCase() === 'user') {
+      const c = m.content;
+      if (typeof c === 'string') return c;
+      if (c == null) return '';
+      if (Array.isArray(c)) {
+        return c.map((p) => (p && (p.text != null ? String(p.text) : p.content != null ? String(p.content) : '')) || '').join('');
+      }
+      if (typeof c === 'object') return String(c.text ?? c.content ?? '');
+      return String(c);
+    }
+  }
+  return '';
+}
+
+/** 将 memory 块拼到第一条 system 前；无 system 则插入一条 system */
+function prependMemoryToSystem(messages, memoryBlock) {
+  if (!memoryBlock || !Array.isArray(messages) || messages.length === 0) return messages;
+  const out = [...messages];
+  const firstSystemIdx = out.findIndex((m) => (m?.role || '').toLowerCase() === 'system');
+  const prefix = memoryBlock.trim() + '\n\n';
+  if (firstSystemIdx >= 0) {
+    const orig = out[firstSystemIdx];
+    const origContent = typeof orig.content === 'string' ? orig.content : (orig.content && typeof orig.content === 'object' && !Array.isArray(orig.content) ? String(orig.content?.text ?? orig.content?.content ?? '') : '');
+    out[firstSystemIdx] = { ...orig, content: prefix + origContent };
+  } else {
+    out.unshift({ role: 'system', content: memoryBlock.trim() });
+  }
+  return out;
+}
+
+/** Memory 单轮：仅保留 1 条 system + 1 条当前 user */
+function toSingleTurnMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+  const firstSystem = messages.find((m) => (m?.role || '').toLowerCase() === 'system');
+  const lastUser = [...messages].reverse().find((m) => (m?.role || '').toLowerCase() === 'user');
+  return [firstSystem, lastUser].filter(Boolean);
 }
 
 /** 非流式 completions 串行化：同一时间只跑一个 runAgent，避免多实例冲突与 502 刷屏 */
@@ -217,19 +280,54 @@ const server = http.createServer(async (req, res) => {
       sendError(res, 400, 'messages is required and must be a non-empty array');
       return;
     }
-    if (CURSOR_SINGLE_TURN) {
-      const firstSystem = messages.find((m) => (m.role || '').toLowerCase() === 'system');
-      const lastUser = [...messages].reverse().find((m) => (m.role || '').toLowerCase() === 'user');
-      messages = [firstSystem, lastUser].filter(Boolean);
-      if (messages.length === 0) {
-        sendError(res, 400, 'messages is required and must be a non-empty array');
-        return;
+
+    let workspace = CURSOR_WORKSPACE;
+    let resolution = null;
+
+    if (CURSOR_BRIDGE_MEMORY_ENABLED) {
+      const rawAgentId = req.headers['x-agent-id'] || parsed.agent_id || parsed.agentId;
+      const agentId = (typeof rawAgentId === 'string' ? rawAgentId.trim() : '') || undefined;
+      resolution = resolveWorkspace(agentId, CURSOR_WORKSPACE);
+      workspace = resolution.workspacePath;
+      const memoryContext = readMemoryContext(resolution, {
+        maxRootChars: CURSOR_BRIDGE_MEMORY_NEAR_MAX_ROOT,
+        maxDailyTodayChars: CURSOR_BRIDGE_MEMORY_NEAR_MAX_DAILY_TODAY,
+        maxDailyYesterdayChars: CURSOR_BRIDGE_MEMORY_NEAR_MAX_DAILY_YESTERDAY,
+        maxAgentChars: CURSOR_BRIDGE_MEMORY_NEAR_MAX_AGENT,
+        includeYesterday: true,
+        farDays: CURSOR_BRIDGE_MEMORY_FAR_DAYS,
+        farMaxPerDayChars: CURSOR_BRIDGE_MEMORY_FAR_MAX_PER_DAY,
+        includeOtherAgents: CURSOR_BRIDGE_MEMORY_OTHER_AGENTS,
+        otherMaxPerAgentChars: CURSOR_BRIDGE_MEMORY_OTHER_MAX_PER_AGENT,
+      });
+      if (memoryContext) {
+        if (CURSOR_BRIDGE_MEMORY_SINGLE_TURN) {
+          messages = toSingleTurnMessages(messages);
+          if (messages.length === 0) {
+            sendError(res, 400, 'messages is required and must be a non-empty array');
+            return;
+          }
+          if (BRIDGE_DEBUG) console.log('[bridge] Memory 单轮模式，仅用 1 system + 1 user（原 %d 条）', parsed.messages.length);
+        }
+        messages = prependMemoryToSystem(messages, memoryContext);
       }
-      if (BRIDGE_DEBUG) console.log('[bridge] /v1/chat/completions: 单轮模式，仅用 1 条 system + 1 条当前 user（原 %d 条）', parsed.messages.length);
-    } else if (CURSOR_MAX_MESSAGES > 0 && messages.length > CURSOR_MAX_MESSAGES) {
-      messages = messages.slice(-CURSOR_MAX_MESSAGES);
-      if (BRIDGE_DEBUG) console.log('[bridge] /v1/chat/completions: 仅使用最近 %d 条消息（原 %d 条）', CURSOR_MAX_MESSAGES, parsed.messages.length);
+    } else {
+      if (CURSOR_SINGLE_TURN) {
+        const firstSystem = messages.find((m) => (m.role || '').toLowerCase() === 'system');
+        const lastUser = [...messages].reverse().find((m) => (m.role || '').toLowerCase() === 'user');
+        messages = [firstSystem, lastUser].filter(Boolean);
+        if (messages.length === 0) {
+          sendError(res, 400, 'messages is required and must be a non-empty array');
+          return;
+        }
+        if (BRIDGE_DEBUG) console.log('[bridge] /v1/chat/completions: 单轮模式，仅用 1 条 system + 1 条当前 user（原 %d 条）', parsed.messages.length);
+      } else if (CURSOR_MAX_MESSAGES > 0 && messages.length > CURSOR_MAX_MESSAGES) {
+        messages = messages.slice(-CURSOR_MAX_MESSAGES);
+        if (BRIDGE_DEBUG) console.log('[bridge] /v1/chat/completions: 仅使用最近 %d 条消息（原 %d 条）', CURSOR_MAX_MESSAGES, parsed.messages.length);
+      }
     }
+
+    const lastUserContent = getLastUserContent(messages);
 
     let stream = Boolean(parsed.stream);
     const clientWantedStream = Boolean(parsed.stream);
@@ -259,7 +357,7 @@ const server = http.createServer(async (req, res) => {
         if (BRIDGE_DEBUG) console.log('[bridge] [%s] runAgent start (非流式)', id);
         const result = await runAgent({
           prompt,
-          workspace: CURSOR_WORKSPACE,
+          workspace,
           bin: CURSOR_AGENT_BIN,
           timeoutMs: CURSOR_AGENT_TIMEOUT_MS,
           model: CURSOR_AGENT_MODEL,
@@ -294,6 +392,12 @@ const server = http.createServer(async (req, res) => {
         }
 
         const content = result.content != null ? String(result.content) : '';
+        if (CURSOR_BRIDGE_UPDATE_DAILY && resolution) {
+          appendDailyNote(resolution.notesRoot, id, lastUserContent, content, {
+            agentId: resolution.agentId,
+            throttleMin: CURSOR_BRIDGE_DAILY_WRITE_THROTTLE_MIN,
+          });
+        }
         if (BRIDGE_DEBUG) {
           if (content.length === 0) {
             console.warn('[bridge] [%s] /v1/chat/completions 200 但 content 为空，界面会无回复。', id);
@@ -347,7 +451,7 @@ const server = http.createServer(async (req, res) => {
 
     const { stream: agentStream, kill } = runAgentStream({
       prompt,
-      workspace: CURSOR_WORKSPACE,
+      workspace,
       bin: CURSOR_AGENT_BIN,
       timeoutMs: CURSOR_AGENT_TIMEOUT_MS,
       model: CURSOR_AGENT_MODEL,
@@ -367,6 +471,12 @@ const server = http.createServer(async (req, res) => {
       if (streamTimeoutId) clearTimeout(streamTimeoutId);
       streamTimeoutId = null;
       kill();
+      if (CURSOR_BRIDGE_UPDATE_DAILY && resolution) {
+        appendDailyNote(resolution.notesRoot, id, lastUserContent, '(流式回复)', {
+          agentId: resolution.agentId,
+          throttleMin: CURSOR_BRIDGE_DAILY_WRITE_THROTTLE_MIN,
+        });
+      }
       if (streamChunkCount === 0) {
         console.warn('[bridge] [%s] 流式结束但未输出任何 content，界面可能无回复。常见原因：仅 heartbeat/thinking、或 agent 未产出 result 行。', id);
       }
