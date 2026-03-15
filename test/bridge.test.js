@@ -105,4 +105,53 @@ describe('cursor-bridge', () => {
     assert.ok(/天气|晴|气温|上海|收到/.test(text), `SSE body should contain reply: ${text.slice(0, 300)}`);
     assert.ok(text.includes('[DONE]') || text.includes('finish_reason'), 'should have finish or [DONE]');
   });
+
+  it('POST /v1/chat/completions 多模态：image_url 落盘后拼入 prompt 并 200', async () => {
+    const prev = process.env.CURSOR_BRIDGE_MULTIMODAL_IMAGES;
+    process.env.CURSOR_BRIDGE_MULTIMODAL_IMAGES = '1';
+    const miniPng =
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-agent',
+        stream: false,
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: '看图回复测试' }, { type: 'image_url', image_url: { url: miniPng } }] },
+        ],
+      }),
+    });
+    if (prev !== undefined) process.env.CURSOR_BRIDGE_MULTIMODAL_IMAGES = prev;
+    else delete process.env.CURSOR_BRIDGE_MULTIMODAL_IMAGES;
+
+    const text = await res.text();
+    assert.strictEqual(res.status, 200, `expected 200 got ${res.status} ${text.slice(0, 500)}`);
+    const body = JSON.parse(text);
+    assert.ok(body.choices && body.choices[0]);
+    const content = body.choices[0].message?.content ?? '';
+    assert.ok(content.length > 0, '应有回复内容');
+  });
+
+  it('POST /v1/chat/completions 多模态：无效 image_url 返回 400', async () => {
+    const prev = process.env.CURSOR_BRIDGE_MULTIMODAL_IMAGES;
+    process.env.CURSOR_BRIDGE_MULTIMODAL_IMAGES = '1';
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-agent',
+        stream: false,
+        messages: [
+          { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,' } }] },
+        ],
+      }),
+    });
+    if (prev !== undefined) process.env.CURSOR_BRIDGE_MULTIMODAL_IMAGES = prev;
+    else delete process.env.CURSOR_BRIDGE_MULTIMODAL_IMAGES;
+
+    assert.strictEqual(res.status, 400);
+    const body = await res.json();
+    assert.ok(body.error && body.error.message);
+  });
 });

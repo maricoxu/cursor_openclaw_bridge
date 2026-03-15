@@ -22,6 +22,7 @@ import { createStreamParser } from './stream-parser.js';
 import { resolveWorkspace } from './memory-resolver.js';
 import { readMemoryContext } from './memory-reader.js';
 import { appendDailyNote } from './daily-writer.js';
+import { getMultimodalOptions, processMessagesForMultimodal, cleanupUploadsDir, MultimodalError } from './multimodal-images.js';
 
 import dotenv from 'dotenv';
 if (process.env.NODE_ENV !== 'test') {
@@ -327,6 +328,20 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    const reqId = `bridge-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const multimodalOpts = getMultimodalOptions(workspace);
+    if (multimodalOpts.multimodalImagesEnabled) {
+      try {
+        messages = processMessagesForMultimodal(messages, reqId, multimodalOpts);
+      } catch (err) {
+        if (err instanceof MultimodalError) {
+          sendError(res, err.statusCode, err.message);
+          return;
+        }
+        throw err;
+      }
+    }
+
     const lastUserContent = getLastUserContent(messages);
 
     let stream = Boolean(parsed.stream);
@@ -336,7 +351,6 @@ const server = http.createServer(async (req, res) => {
       stream = false;
     }
     const prompt = buildPrompt(messages);
-    const reqId = `bridge-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     if (BRIDGE_DEBUG) {
       const last = messages[messages.length - 1];
       const lastContentType = last?.content == null ? 'null' : Array.isArray(last.content) ? 'array' : typeof last.content;
@@ -666,6 +680,26 @@ if (process.env.NODE_ENV !== 'test') {
     const cfg = getEffectiveConfig();
     console.log('[bridge] effective config: envFileExists=%s cwd=%s CURSOR_WORKSPACE=%s CURSOR_AGENT_BIN=%s CURSOR_AGENT_TIMEOUT_MS=%s',
       cfg.envFileExists, cfg.cwd, cfg.CURSOR_WORKSPACE, cfg.CURSOR_AGENT_BIN, cfg.CURSOR_AGENT_TIMEOUT_MS);
+
+    const cleanupHour = parseInt(process.env.CURSOR_BRIDGE_UPLOAD_CLEANUP_HOUR ?? '22', 10);
+    const cleanupOlderHours = Math.max(1, parseInt(process.env.CURSOR_BRIDGE_UPLOAD_CLEANUP_OLDER_HOURS ?? '24', 10));
+    if (cleanupHour >= 0 && cleanupHour <= 23) {
+      let lastCleanupDay = null;
+      const runCleanupIfScheduled = () => {
+        const now = new Date();
+        if (now.getHours() !== cleanupHour) return;
+        const today = now.toDateString();
+        if (lastCleanupDay === today) return;
+        lastCleanupDay = today;
+        const opts = getMultimodalOptions(CURSOR_WORKSPACE);
+        const result = cleanupUploadsDir(opts.workspacePath, opts.uploadDir, cleanupOlderHours);
+        if (result.deleted > 0 || result.errors > 0) {
+          console.log('[bridge] 多模态上传目录定时清理: deleted=%d errors=%d', result.deleted, result.errors);
+        }
+      };
+      setInterval(runCleanupIfScheduled, 60 * 60 * 1000);
+      runCleanupIfScheduled();
+    }
   });
 }
 

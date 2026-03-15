@@ -7,3 +7,4 @@ node_modules/
 .cursor-bridge-last-prompt.txt
 .cursor-bridge-last-stdout.txt
 .cursor-agent-raw-stdout.txt
+.bridge-uploads/
